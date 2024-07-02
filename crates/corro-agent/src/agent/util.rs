@@ -800,6 +800,13 @@ pub async fn process_multiple_changes(
                         }
                         Err(e) => {
                             error!(%actor_id, ?versions, "could not process single change: {e}");
+                            if is_sqlite_error(&e) {
+                                Err(ChangeError::Rusqlite {
+                                    source: e,
+                                    actor_id: Some(actor_id),
+                                    version: None,
+                                })?;
+                            }
                             continue;
                         }
                     };
@@ -1222,4 +1229,14 @@ pub fn check_buffered_meta_to_clear(
     }
 
     conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
+}
+
+fn is_sqlite_error(e: &rusqlite::Error) -> bool {
+    match e.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy)
+        | Some(rusqlite::ErrorCode::DiskFull)
+        | Some(rusqlite::ErrorCode::SystemIoFailure)
+        | Some(rusqlite::ErrorCode::OutOfMemory) => true,
+        _ => false,
+    }
 }
