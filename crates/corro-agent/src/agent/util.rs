@@ -782,34 +782,25 @@ pub async fn process_multiple_changes(
                         }
                     }
 
-                    let (known, versions) = match process_single_version(
+                    let (known, changeset) = process_single_version(
                         &agent,
                         &tx,
                         last_db_version,
                         change,
-                    ) {
-                        Ok((known, changeset)) => {
-                            let versions = changeset.versions();
-                            if let KnownDbVersion::Current(CurrentVersion { db_version, .. }) =
-                                &known
-                            {
-                                last_db_version = Some(*db_version);
-                                changesets.push((actor_id, changeset, *db_version, src));
-                            }
-                            (known, versions)
-                        }
-                        Err(e) => {
-                            error!(%actor_id, ?versions, "could not process single change: {e}");
-                            if is_sqlite_error(&e) {
-                                Err(ChangeError::Rusqlite {
-                                    source: e,
-                                    actor_id: Some(actor_id),
-                                    version: None,
-                                })?;
-                            }
-                            continue;
-                        }
-                    };
+                    ).map_err(|source| ChangeError::Rusqlite {
+                        source,
+                        actor_id: Some(actor_id),
+                        version: None,
+                    })?;
+
+                    let versions = changeset.versions();
+                    if let KnownDbVersion::Current(CurrentVersion { db_version, .. }) =
+                        &known
+                    {
+                        last_db_version = Some(*db_version);
+                        changesets.push((actor_id, changeset, *db_version, src));
+                    }
+
                     debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "got known to insert: {known:?}");
                     known
                 };
@@ -1229,14 +1220,4 @@ pub fn check_buffered_meta_to_clear(
     }
 
     conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
-}
-
-fn is_sqlite_error(e: &rusqlite::Error) -> bool {
-    match e.sqlite_error_code() {
-        Some(rusqlite::ErrorCode::DatabaseBusy)
-        | Some(rusqlite::ErrorCode::DiskFull)
-        | Some(rusqlite::ErrorCode::SystemIoFailure)
-        | Some(rusqlite::ErrorCode::OutOfMemory) => true,
-        _ => false,
-    }
 }
