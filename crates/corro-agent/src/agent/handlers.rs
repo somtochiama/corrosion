@@ -2,6 +2,9 @@
 //!
 //! This module is _big_ and maybe should be split up further.
 
+use std::collections::HashMap;
+use std::ops::RangeInclusive;
+
 use std::{
     cmp,
     collections::VecDeque,
@@ -10,27 +13,38 @@ use std::{
 };
 
 use crate::{
-    agent::{bi, bootstrap, uni, util, SyncClientError, ANNOUNCE_INTERVAL},
+    agent::{
+        bi, bootstrap, uni,
+        util::{log_at_pow_10, process_multiple_changes},
+        SyncClientError, ANNOUNCE_INTERVAL,
+    },
     api::peer::parallel_sync,
     transport::Transport,
 };
+use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, Bookie, SplitPool},
+    agent::{get_last_cleared_ts, Agent, Bookie, SplitPool},
     base::CrsqlSeq,
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset, FocaInput},
     channel::CorroReceiver,
     members::MemberAddedResult,
     sync::generate_sync,
 };
 
 use bytes::Bytes;
+use corro_types::agent::ChangeError;
+use corro_types::base::Version;
+use corro_types::broadcast::Timestamp;
+use corro_types::change::store_empty_changeset;
 use foca::Notification;
+use indexmap::map::Entry;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use spawn::spawn_counted;
+use tokio::time::sleep;
 use tokio::{
     sync::mpsc::Receiver as TokioReceiver,
     task::{block_in_place, JoinSet},
@@ -92,7 +106,7 @@ pub fn spawn_incoming_connection_handlers(
     tokio::spawn(async move {
         let remote_addr = connecting.remote_address();
         // let local_ip = connecting.local_ip().unwrap();
-        debug!("got a connection from {remote_addr}");
+        trace!("got a connection from {remote_addr}");
 
         let conn = match connecting.await {
             Ok(conn) => conn,
@@ -104,11 +118,16 @@ pub fn spawn_incoming_connection_handlers(
 
         counter!("corro.peer.connection.accept.total").increment(1);
 
-        debug!("accepted a QUIC conn from {remote_addr}");
+        trace!("accepted a QUIC conn from {remote_addr}");
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
-        uni::spawn_unipayload_handler(&tripwire, &conn, agent.clone());
+        uni::spawn_unipayload_handler(
+            &tripwire,
+            &conn,
+            agent.cluster_id(),
+            agent.tx_changes().clone(),
+        );
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
 }
@@ -270,9 +289,29 @@ pub async fn handle_notifications(
                         debug!("Member Added {actor:?}");
                         counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
 
+                        let last_cleared_ts = {
+                            match agent.pool().read().await {
+                                Ok(conn) => {
+                                    get_last_cleared_ts(&conn, actor.id()).unwrap_or_else(|e| {
+                                        error!("could not get last_empty_ts: {e}");
+                                        None
+                                    })
+                                }
+                                Err(e) => {
+                                    error!("could not get read conn: {e}");
+                                    None
+                                }
+                            }
+                        };
+
+                        let members_len = {
+                            let mut members = agent.members().write();
+                            members.update_last_empty(&actor.id(), last_cleared_ts);
+                            members.states.len() as u32
+                        };
+
                         // actually added a member
                         // notify of new cluster size
-                        let members_len = agent.members().read().states.len() as u32;
                         if let Ok(size) = members_len.try_into() {
                             if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await
                             {
@@ -346,7 +385,7 @@ pub async fn handle_notifications(
 /// multiple gigabytes and needs periodic truncation.  We don't want
 /// to schedule this task too often since it locks the whole DB.
 // TODO: can we get around the lock somehow?
-fn db_cleanup(conn: &rusqlite::Connection) -> eyre::Result<()> {
+fn wal_checkpoint(conn: &rusqlite::Connection) -> eyre::Result<()> {
     debug!("handling db_cleanup (WAL truncation)");
     let start = Instant::now();
 
@@ -367,25 +406,325 @@ fn db_cleanup(conn: &rusqlite::Connection) -> eyre::Result<()> {
     Ok::<_, eyre::Report>(())
 }
 
-/// See `db_cleanup`
-pub fn spawn_handle_db_cleanup(pool: SplitPool) {
-    tokio::spawn(async move {
-        let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
-        loop {
-            db_cleanup_interval.tick().await;
+/// If the number of unused free pages is above the provided limit,
+/// This function continously runs an incremental_vacuum
+/// until it is below the limit
+///
+async fn vacuum_db(pool: &SplitPool, lim: u64) -> eyre::Result<()> {
+    let mut freelist: u64 = {
+        let conn = pool.read().await?;
 
-            match pool.write_low().await {
-                Ok(conn) => {
-                    if let Err(e) = block_in_place(|| db_cleanup(&conn)) {
-                        error!("could not truncate db: {e}");
-                    }
-                }
-                Err(e) => {
-                    error!("could not acquire low priority conn to truncate wal: {e}")
-                }
+        let vacuum: u64 = conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+        if vacuum != 2 {
+            warn!("auto_vacuum isn't set to INCREMENTAL");
+            return Err(rusqlite::Error::ModuleError(
+                "auto_vacuum has to be set to INCREMENTAL".to_string(),
+            )
+            .into());
+        }
+
+        conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?
+    };
+
+    debug!("freelist count: {freelist:?}");
+
+    let (busy_timeout, cache_size) = {
+        // update settings in write conn
+        let conn = pool.write_low().await?;
+        let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+        conn.pragma_update(None, "busy_timeout", 60000)?;
+
+        let cache_size: i64 = conn.pragma_query_value(None, "cache_size", |row| row.get(0))?;
+        conn.pragma_update(None, "cache_size", 100000)?;
+        (orig, cache_size)
+    };
+
+    while freelist >= lim {
+        let conn = pool.write_low().await?;
+
+        block_in_place(|| {
+            let start = Instant::now();
+
+            let mut prepped = conn.prepare("pragma incremental_vacuum(1000)")?;
+            let mut rows = prepped.query([])?;
+
+            while let Ok(Some(_)) = rows.next() {}
+            histogram!("corro.db.incremental.vacuum.seconds").record(start.elapsed().as_secs_f64());
+
+            freelist = conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+            debug!("freelist count after incremental vacuum: {freelist:?}");
+
+            Ok::<(), eyre::Error>(())
+        })?;
+
+        drop(conn);
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    let conn = pool.write_low().await?;
+    conn.pragma_update(None, "busy_timeout", busy_timeout)?;
+    conn.pragma_update(None, "cache_size", cache_size)?;
+
+    Ok::<_, eyre::Report>(())
+}
+
+/// See `db_cleanup` and `vacuum_db`
+pub fn spawn_handle_db_maintenance(agent: &Agent) {
+    let mut wal_path = agent.config().db.path.clone();
+    let wal_threshold = agent.config().perf.wal_threshold_gb as u64;
+    wal_path.set_extension(format!("{}-wal", wal_path.extension().unwrap_or_default()));
+
+    let pool = agent.pool().clone();
+
+    tokio::spawn(async move {
+        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024 * 1024;
+
+        // try to initially truncate the WAL
+        match wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold).await
+        {
+            Ok(truncated) if truncated => {
+                info!("initially truncated WAL");
+            }
+            Err(e) => {
+                error!("could not initially truncate WAL: {e}");
+            }
+            _ => {}
+        }
+
+        // large sleep right at the start to give node time to sync
+        sleep(Duration::from_secs(60)).await;
+
+        let mut vacuum_interval = tokio::time::interval(Duration::from_secs(60 * 5));
+
+        const MAX_DB_FREE_PAGES: u64 = 10000;
+
+        loop {
+            vacuum_interval.tick().await;
+            if let Err(e) = vacuum_db(&pool, MAX_DB_FREE_PAGES).await {
+                error!("could not check freelist and vacuum: {e}");
+            }
+
+            if let Err(e) =
+                wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold)
+                    .await
+            {
+                error!("could not wal_checkpoint truncate: {e}");
             }
         }
     });
+}
+
+async fn wal_checkpoint_over_threshold(
+    wal_path: &Utf8Path,
+    pool: &SplitPool,
+    threshold: u64,
+) -> eyre::Result<bool> {
+    let should_truncate = wal_path.metadata()?.len() > threshold;
+    if should_truncate {
+        let conn = pool.write_low().await?;
+        block_in_place(|| wal_checkpoint(&conn))?;
+    }
+    Ok(should_truncate)
+}
+
+/// Handle incoming emptyset received during syncs
+///_
+#[allow(dead_code)]
+pub async fn handle_emptyset(
+    agent: Agent,
+    bookie: Bookie,
+    mut rx_emptysets: CorroReceiver<ChangeV1>,
+    mut tripwire: Tripwire,
+) {
+    type EmptyQueue = VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>;
+    let mut buf: HashMap<ActorId, EmptyQueue> = HashMap::new();
+
+    let mut join_set: JoinSet<HashMap<ActorId, EmptyQueue>> = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            res = join_set.join_next(), if !join_set.is_empty() => {
+                debug!("processed emptysets!");
+                if let Some(Ok(res)) = res {
+                    for (actor_id, mut changes) in res {
+                        if !changes.is_empty() {
+                            let curr = buf.entry(actor_id).or_default();
+                            changes.append(curr);
+                            *curr = changes;
+                        }
+                    }
+                }
+            },
+            maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
+                Some(change) => {
+                    if let Changeset::EmptySet { versions, ts } = change.changeset {
+                        buf.entry(change.actor_id).or_default().push_back((versions.clone(), ts));
+                    } else {
+                        warn!("received non-emptyset changes in emptyset channel from {}", change.actor_id);
+                    }
+                },
+                None => break,
+            },
+            _ = &mut tripwire => {
+                break;
+            }
+        }
+
+        if join_set.is_empty() && !buf.is_empty() {
+            let mut to_process = std::mem::take(&mut buf);
+            let agent = agent.clone();
+            let bookie = bookie.clone();
+            join_set.spawn(async move {
+                for (actor, changes) in &mut to_process {
+                    while !changes.is_empty() {
+                        let change = changes.pop_front().unwrap();
+                        if let Some(booked) = bookie
+                            .read("process_emptyset(check ts)",actor.as_simple())
+                            .await
+                            .get(actor)
+                        {
+                            let booked_read = booked
+                                .read("process_emptyset(booked writer, ts timestamp)", actor.as_simple())
+                                .await;
+
+                            if let Some(seen_ts) = booked_read.last_cleared_ts() {
+                                if seen_ts > change.1 {
+                                    warn!("skipping change because last cleared ts '{:?}' is greater than empty ts: {:?}",
+                                        seen_ts, change.1);
+                                    continue;
+                                }
+                            }
+                        }
+                        match process_emptyset(agent.clone(), bookie.clone(), *actor, &change).await
+                        {
+                            Ok(()) => {}
+                            Err(e) => {
+                                warn!("encountered error when processing emptyset - {e}");
+                                changes.push_front(change);
+                                break;
+                            }
+                        }
+                    }
+                }
+                to_process
+            });
+        };
+    }
+
+    info!("shutting down handle empties loop");
+}
+
+#[allow(dead_code)]
+pub async fn process_emptyset(
+    agent: Agent,
+    bookie: Bookie,
+    actor_id: ActorId,
+    changes: &(Vec<RangeInclusive<Version>>, Timestamp),
+) -> Result<(), ChangeError> {
+    let (versions, ts) = changes;
+
+    let version_iter = versions.chunks(100);
+
+    for chunk in version_iter {
+        let mut conn = agent.pool().write_low().await?;
+        debug!("processing emptyset from {:?}", actor_id);
+        let booked = {
+            bookie
+                .write(
+                    "process_emptyset(booked writer, updates timestamp)",
+                    actor_id.as_simple(),
+                )
+                .await
+                .ensure(actor_id)
+        };
+
+        let mut booked_write = booked
+            .write(
+                "process_emptyset(booked writer, updates timestamp)",
+                actor_id.as_simple(),
+            )
+            .await;
+
+        let mut snap = booked_write.snapshot();
+
+        debug!(self_actor_id = %agent.actor_id(), "processing emptyset changes, len: {}", versions.len());
+        block_in_place(|| {
+            let tx = conn
+                .immediate_transaction()
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: None,
+                    version: None,
+                })?;
+
+            for version in chunk {
+                store_empty_changeset(&tx, actor_id, version.clone(), *ts)?;
+            }
+
+            snap.insert_db(&tx, RangeInclusiveSet::from_iter(chunk.iter().cloned()))
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: None,
+                    version: None,
+                })?;
+
+            tx.commit().map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
+
+            booked_write.commit_snapshot(snap);
+            counter!("corro.sync.empties.count", "actor" => format!("{}", actor_id.to_string()))
+                .increment(chunk.len() as u64);
+
+            Ok::<_, ChangeError>(())
+        })?;
+    }
+
+    let mut conn = agent.pool().write_low().await?;
+    let booked = {
+        bookie
+            .write(
+                "process_emptyset(booked writer, updates timestamp)",
+                actor_id.as_simple(),
+            )
+            .await
+            .ensure(actor_id)
+    };
+
+    let mut booked_write = booked
+        .write(
+            "process_emptyset(booked writer, updates timestamp)",
+            actor_id.as_simple(),
+        )
+        .await;
+
+    let tx = conn
+        .immediate_transaction()
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })?;
+
+    let mut snap = booked_write.snapshot();
+    snap.update_cleared_ts(&tx, *ts)
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })?;
+
+    tx.commit().map_err(|source| ChangeError::Rusqlite {
+        source,
+        actor_id: None,
+        version: None,
+    })?;
+
+    booked_write.commit_snapshot(snap);
+
+    Ok(())
 }
 
 /// Bundle incoming changes to optimise transaction sizes with SQLite
@@ -401,9 +740,11 @@ pub async fn handle_changes(
     mut tripwire: Tripwire,
 ) {
     let max_changes_chunk: usize = agent.config().perf.apply_queue_len;
+    let max_queue_len: usize = agent.config().perf.processing_queue_len;
+    let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
     let mut queue: VecDeque<(ChangeV1, ChangeSource, Instant)> = VecDeque::new();
     let mut buf = vec![];
-    let mut count = 0;
+    let mut buf_cost = 0;
 
     const MAX_CONCURRENT: usize = 5;
     let mut join_set = JoinSet::new();
@@ -412,22 +753,23 @@ pub async fn handle_changes(
         agent.config().perf.apply_queue_timeout as u64,
     ));
 
-    const MAX_SEEN_CACHE_LEN: usize = 10000;
-    const KEEP_SEEN_CACHE_SIZE: usize = 1000;
+    let max_seen_cache_len: usize = max_queue_len;
+    let keep_seen_cache_size: usize = cmp::max(10, max_seen_cache_len / 10);
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
+    let mut drop_log_count: u64 = 0;
     // complicated loop to process changes efficiently w/ a max concurrency
     // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
-        while count >= max_changes_chunk && join_set.len() < MAX_CONCURRENT {
-            // we're already bigger than the minimum size of changes batch
-            // so we want to accumulate at least that much and process them
-            // concurrently bvased on MAX_CONCURRENCY
-            let mut tmp_count = 0;
+        while (buf_cost >= max_changes_chunk || (!queue.is_empty() && join_set.is_empty()))
+            && join_set.len() < MAX_CONCURRENT
+        {
+            // Process if we hit the chunk size OR if we have any items and available capacity
+            let mut tmp_cost = 0;
             while let Some((change, src, queued_at)) = queue.pop_front() {
-                tmp_count += change.len();
+                tmp_cost += change.processing_cost();
                 buf.push((change, src, queued_at));
-                if tmp_count >= max_changes_chunk {
+                if tmp_cost >= max_changes_chunk {
                     break;
                 }
             }
@@ -436,17 +778,17 @@ pub async fn handle_changes(
                 break;
             }
 
-            debug!(count = %tmp_count, "spawning processing multiple changes from beginning of loop");
-            join_set.spawn(util::process_multiple_changes(
-                agent.clone(),
-                bookie.clone(),
-                std::mem::take(&mut buf),
-            ));
+            debug!(count = %tmp_cost, "spawning processing multiple changes from beginning of loop");
+            let changes = std::mem::take(&mut buf);
+            let agent = agent.clone();
+            let bookie = bookie.clone();
+            join_set.spawn(process_multiple_changes(agent, bookie, changes.clone(), tx_timeout));
+            counter!("corro.agent.changes.batch.spawned").increment(1);
 
-            count -= tmp_count;
+            buf_cost -= tmp_cost;
         }
 
-        tokio::select! {
+        let (change, src) = tokio::select! {
             biased;
 
             // process these first, we don't care about the result,
@@ -459,152 +801,144 @@ pub async fn handle_changes(
                 continue;
             },
 
-            Some((change, src)) = rx_changes.recv() => {
-                let change_len = change.len();
-                counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64); // count empties...
-
-                if change.actor_id == agent.actor_id() {
-                    continue;
-                }
-
-                if let Some(mut seqs) = change.seqs().cloned() {
-                    let v = *change.versions().start();
-                    if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
-                        if seqs.all(|seq| seen_seqs.contains(&seq)) {
-                            continue;
-                        }
-                    }
-                } else {
-                    // empty versions
-                    if change.versions().all(|v| seen.contains_key(&(change.actor_id, v))) {
-                        continue;
-                    }
-                }
-
-                let recv_lag = change
-                    .ts()
-                    .map(|ts| (agent.clock().new_timestamp().get_time() - ts.0).to_duration());
-
-                if matches!(src, ChangeSource::Broadcast) {
-                    counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
-                }
-
-                let booked = {
-                    bookie
-                        .read(format!(
-                            "handle_change(get):{}",
-                            change.actor_id.as_simple()
-                        ))
-                        .await
-                        .get(&change.actor_id)
-                        .cloned()
-                };
-
-                if let Some(booked) = booked {
-                    if booked
-                        .read(format!(
-                            "handle_change(contains?):{}",
-                            change.actor_id.as_simple()
-                        ))
-                        .await
-                        .contains_all(change.versions(), change.seqs())
-                    {
-                        trace!("already seen, stop disseminating");
-                        continue;
-                    }
-                }
-
-                if let Some(recv_lag) = recv_lag {
-                    let src_str: &'static str = src.into();
-                    histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str).record(recv_lag.as_secs_f64());
-                }
-
-                // this will only run once for a non-empty changeset
-                for v in change.versions() {
-                    let entry = seen.entry((change.actor_id, v)).or_default();
-                    if let Some(seqs) = change.seqs().cloned() {
-                        entry.extend([seqs]);
-                    }
-                }
-
-                if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
-                    if let Err(_e) =
-                        agent
-                            .tx_bcast()
-                            .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(change.clone())))
-                    {
-                        debug!("broadcasts are full or done!");
-                    }
-                }
-
-                queue.push_back((change, src, Instant::now()));
-
-                count += change_len; // track number of individual changes, not changesets
+            maybe_change_src = rx_changes.recv() => match maybe_change_src {
+                Some((change, src)) => (change, src),
+                None => break,
             },
 
             _ = max_wait.tick() => {
                 // got a wait interval tick...
 
-                gauge!("corro.agent.changes.in_queue").set(count as f64);
+                gauge!("corro.agent.changes.in_queue").set(buf_cost as f64);
                 gauge!("corro.agent.changesets.in_queue").set(queue.len() as f64);
                 gauge!("corro.agent.changes.processing.jobs").set(join_set.len() as f64);
 
-                if count < max_changes_chunk && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
+                if buf_cost < max_changes_chunk && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
                     // we can process this right away
-                    debug!(%count, "spawning processing multiple changes from max wait interval");
-                    join_set.spawn(util::process_multiple_changes(
-                        agent.clone(),
-                        bookie.clone(),
-                        queue.drain(..).collect(),
-                    ));
-                    count = 0;
+                    debug!(%buf_cost, "spawning processing multiple changes from max wait interval");
+                    let changes: Vec<_> = queue.drain(..).collect();
+                    let agent = agent.clone();
+                    let bookie = bookie.clone();
+                    join_set.spawn(process_multiple_changes(agent, bookie, changes.clone(), tx_timeout));
+                    counter!("corro.agent.changes.batch.spawned").increment(1);
+                    buf_cost = 0;
                 }
 
-                if seen.len() > MAX_SEEN_CACHE_LEN {
+                if seen.len() > max_seen_cache_len {
                     // we don't want to keep too many entries in here.
-                    seen = seen.split_off(seen.len() - KEEP_SEEN_CACHE_SIZE);
+                    seen = seen.split_off(seen.len() - keep_seen_cache_size);
                 }
+                continue
             },
 
             _ = &mut tripwire => {
                 break;
             }
+        };
 
-            else => {
-                break;
-            }
+        let change_len = change.len();
+        counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64); // count empties...
+
+        if change.actor_id == agent.actor_id() {
+            continue;
         }
-    }
 
-    info!("Draining changes receiver...");
-
-    // drain!
-    while let Ok((change, src)) = rx_changes.try_recv() {
-        let changes_count = std::cmp::max(change.len(), 1);
-        counter!("corro.agent.changes.recv").increment(changes_count as u64);
-        count += changes_count;
-        queue.push_back((change, src, Instant::now()));
-        if count >= max_changes_chunk {
-            // drain and process current changes!
-            if let Err(e) = util::process_multiple_changes(
-                agent.clone(),
-                bookie.clone(),
-                queue.drain(..).collect(),
-            )
-            .await
+        if let Some(mut seqs) = change.seqs().cloned() {
+            let v = *change.versions().start();
+            if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
+                if seqs.all(|seq| seen_seqs.contains(&seq)) {
+                    continue;
+                }
+            }
+        } else {
+            // empty versions
+            if change
+                .versions()
+                .all(|v| seen.contains_key(&(change.actor_id, v)))
             {
-                error!("could not process last multiple changes: {e}");
+                continue;
             }
-
-            // reset count
-            count = 0;
         }
-    }
 
-    // process the last changes we got!
-    if let Err(e) = util::process_multiple_changes(agent, bookie, queue.into_iter().collect()).await
-    {
-        error!("could not process multiple changes: {e}");
+        let recv_lag = change
+            .ts()
+            .map(|ts| (agent.clock().new_timestamp().get_time() - ts.0).to_duration());
+
+        if matches!(src, ChangeSource::Broadcast) {
+            counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
+        }
+
+        let booked = {
+            bookie
+                .read("handle_change(get)", change.actor_id.as_simple())
+                .await
+                .get(&change.actor_id)
+                .cloned()
+        };
+
+        if let Some(booked) = booked {
+            if booked
+                .read("handle_change(contains?)", change.actor_id.as_simple())
+                .await
+                .contains_all(change.versions(), change.seqs())
+            {
+                trace!("already seen, stop disseminating");
+                continue;
+            }
+        }
+
+        // drop old items when the queue is full.
+        if queue.len() >= max_queue_len {
+            let mut dropped_count = 0;
+            if let Some((dropped_change, _, _)) = queue.pop_front() {
+                for v in dropped_change.versions() {
+                    if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
+                        if let Some(seqs) = dropped_change.seqs().cloned() {
+                            entry.get_mut().remove(seqs);
+                        } else {
+                            entry.remove_entry();
+                        }
+                    };
+                }
+
+                buf_cost -= dropped_change.processing_cost();
+                dropped_count += 1;
+            }
+            counter!("corro.agent.changes.dropped").increment(dropped_count);
+
+            log_at_pow_10("dropped old change from queue", &mut drop_log_count);
+        }
+
+        if let Some(recv_lag) = recv_lag {
+            let src_str: &'static str = src.into();
+            histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str)
+                .record(recv_lag.as_secs_f64());
+        }
+
+        // this will only run once for a non-empty changeset
+        for v in change.versions() {
+            let entry = seen.entry((change.actor_id, v)).or_default();
+            if let Some(seqs) = change.seqs().cloned() {
+                entry.extend([seqs]);
+            }
+        }
+
+        if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
+            if let Err(_e) =
+                agent
+                    .tx_bcast()
+                    .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(
+                        change.clone(),
+                    )))
+            {
+                debug!("broadcasts are full or done!");
+            }
+        }
+
+        let cost = change.processing_cost();
+        queue.push_back((change, src, Instant::now()));
+
+        buf_cost += cost; // tracks the cost, not number of changes
     }
 }
 
@@ -640,8 +974,15 @@ pub async fn handle_sync(
                     **id != agent.actor_id() && state.cluster_id == agent.cluster_id()
                 })
                 // Grab a ring-buffer index to the member RTT range
-                .map(|(id, state)| (*id, state.ring.unwrap_or(255), state.addr))
-                .collect::<Vec<(ActorId, u8, SocketAddr)>>()
+                .map(|(id, state)| {
+                    (
+                        *id,
+                        state.ring.unwrap_or(255),
+                        state.addr,
+                        state.last_sync_ts,
+                    )
+                })
+                .collect::<Vec<(ActorId, u8, SocketAddr, Option<Timestamp>)>>()
         };
 
         if candidates.is_empty() {
@@ -664,6 +1005,8 @@ pub async fn handle_sync(
             sync_state
                 .need_len_for_actor(&b.0)
                 .cmp(&sync_state.need_len_for_actor(&a.0))
+                // if equal, look at last sync time
+                .then_with(|| a.3.cmp(&b.3))
                 // if equal, look at proximity (via `ring`)
                 .then_with(|| a.1.cmp(&b.1))
         });
@@ -671,7 +1014,7 @@ pub async fn handle_sync(
         choices.truncate(desired_count);
         choices
             .into_iter()
-            .map(|(actor_id, _, addr)| (actor_id, addr))
+            .map(|(actor_id, _, addr, _)| (actor_id, addr))
             .collect()
     };
 
@@ -680,14 +1023,32 @@ pub async fn handle_sync(
         return Ok(());
     }
 
+    let mut last_cleared: HashMap<ActorId, Option<Timestamp>> = HashMap::new();
+
+    for (actor_id, _) in chosen.clone() {
+        let last_ts = match agent.members().read().states.get(&actor_id) {
+            Some(state) => state.last_empty_ts,
+            None => None,
+        };
+
+        last_cleared.insert(actor_id, last_ts);
+    }
+
     let start = Instant::now();
-    let n = parallel_sync(agent, transport, chosen.clone(), sync_state).await?;
+    let n = match parallel_sync(agent, transport, chosen.clone(), sync_state, last_cleared).await {
+        Ok(n) => n,
+        Err(e) => {
+            error!("failed to execute parallel sync: {e:?}");
+            return Err(e.into());
+        }
+    };
 
     let elapsed = start.elapsed();
     if n > 0 {
         info!(
             "synced {n} changes w/ {} in {}s @ {} changes/s",
             chosen
+                .clone()
                 .into_iter()
                 .map(|(actor_id, _)| actor_id.to_string())
                 .collect::<Vec<_>>()
@@ -701,7 +1062,20 @@ pub async fn handle_sync(
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::setup;
+    use crate::api::public::api_v1_db_schema;
+
     use super::*;
+    use axum::{http::StatusCode, Extension, Json};
+    use corro_tests::TEST_SCHEMA;
+    use corro_types::api::{ColumnName, TableName};
+    use corro_types::{
+        base::CrsqlDbVersion, base::Version, change::Change, config::Config, pubsub::pack_columns,
+    };
+    use rusqlite::Connection;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+    use tokio::time::{timeout, Duration};
 
     #[test]
     fn ensure_truncate_works() -> eyre::Result<()> {
@@ -711,10 +1085,150 @@ mod tests {
         let pragma_value = 12345u64;
         conn.pragma_update(None, "busy_timeout", pragma_value)?;
 
-        db_cleanup(&conn)?;
+        wal_checkpoint(&conn)?;
         assert_eq!(
             conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))?,
             pragma_value
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_loadshed_handle_changes() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+        config.perf.apply_queue_len = 1;
+        config.perf.processing_queue_len = 3;
+
+        let (agent, agent_options) = setup(config, tripwire.clone()).await?;
+
+        let (status_code, _res) =
+            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
+        assert_eq!(status_code, StatusCode::OK);
+
+        let other_actor = ActorId(uuid::Uuid::new_v4());
+        let bookie = Bookie::new(Default::default());
+        tokio::spawn(handle_changes(
+            agent.clone(),
+            bookie.clone(),
+            agent_options.rx_changes,
+            tripwire,
+        ));
+
+        {
+            // hold write connection so that max_concurrency is reached
+            let _conn = agent.pool().write_normal().await?;
+
+            // queue size is very small - only three changes
+            // 10-6 are stuck proecessing because we hold the write conn
+            // next two versions, 3-5, enter the queue
+            // last version 2-1, displace 4 and 5 from the queue and
+            // they never get processed
+            for i in (1i64..=10i64).rev() {
+                let crsql_row = Change {
+                    table: TableName("tests".into()),
+                    pk: pack_columns(&vec![i.into()])?,
+                    cid: ColumnName("text".into()),
+                    val: "two override".into(),
+                    col_version: 1,
+                    db_version: CrsqlDbVersion(4),
+                    seq: CrsqlSeq(0),
+                    site_id: agent.actor_id().to_bytes(),
+                    cl: 1,
+                };
+
+                let change = (
+                    ChangeV1 {
+                        actor_id: other_actor,
+                        changeset: Changeset::Full {
+                            version: Version(i as u64),
+                            changes: vec![crsql_row.clone()],
+                            seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                            last_seq: CrsqlSeq(0),
+                            ts: agent.clock().new_timestamp().into(),
+                        },
+                    },
+                    ChangeSource::Sync,
+                );
+
+                agent.tx_changes().send(change).await?;
+            }
+        }
+
+        sleep(Duration::from_secs(2)).await;
+
+        let bookie = bookie.read::<&str, _>("read booked", None).await;
+        let booked = bookie
+            .get(&other_actor)
+            .unwrap()
+            .read::<&str, _>("test", None)
+            .await;
+        assert!(booked.contains_all(Version(6)..=Version(10), None));
+        assert!(booked.contains_all(Version(1)..=Version(3), None));
+        assert!(!booked.contains_version(&Version(5)));
+        assert!(!booked.contains_version(&Version(4)));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn ensure_vacuum_works() -> eyre::Result<()> {
+        let tmpdir = tempfile::tempdir()?;
+        let db_path = tmpdir.into_path().join("db.sqlite");
+
+        {
+            let db_conn = Connection::open(db_path.clone())?;
+            db_conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
+        }
+
+        println!("temp db: {:?}", db_path);
+        let write_sema = Arc::new(Semaphore::new(1));
+        let pool = SplitPool::create(db_path, write_sema.clone()).await?;
+
+        {
+            let mut conn = pool.write_priority().await?;
+            conn.execute(
+                r#"
+            CREATE TABLE test (
+                id BIGINT NOT NULL PRIMARY KEY,
+                col1 TEXT,
+                col2 TEXT,
+                col3 TEXT,
+                col4 TEXT
+            )
+        "#,
+                [],
+            )?;
+
+            let tx = conn.transaction()?;
+            // create 1m rows
+            for i in 1..100000 {
+                tx.execute(
+                    r"INSERT INTO test VALUES (?, ?, ?, ?, ?)",
+                    (i, "colunm 1", "column 2", "column 3", "column 4"),
+                )?;
+            }
+            tx.commit()?;
+
+            conn.execute("DELETE FROM test", [])?;
+            let freelist: u64 =
+                conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+            assert!(freelist > 1000);
+        }
+
+        timeout(Duration::from_secs(2), vacuum_db(&pool, 1000)).await??;
+
+        let conn = pool.read().await?;
+        assert!(
+            conn.pragma_query_value(None, "freelist_count", |row| row.get::<_, u64>(0))? < 1000
         );
 
         Ok(())

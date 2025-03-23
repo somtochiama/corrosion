@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::{Buf, Bytes, BytesMut};
-use corro_api_types::{ChangeId, TypedQueryEvent};
+use corro_api_types::{ChangeId, QueryEvent, TypedNotifyEvent, TypedQueryEvent};
 use futures::{ready, Future, Stream};
 use hyper::{client::HttpConnector, Body};
 use pin_project_lite::pin_project;
@@ -56,6 +56,7 @@ type FramedBody = FramedRead<IoBodyStreamReader, LinesBytesCodec>;
 
 pub struct SubscriptionStream<T> {
     id: Uuid,
+    hash: Option<String>,
     client: hyper::Client<HttpConnector, Body>,
     api_addr: SocketAddr,
     observed_eoq: bool,
@@ -75,8 +76,8 @@ pub enum SubscriptionError {
     Http(#[from] http::Error),
     #[error(transparent)]
     Deserialize(#[from] serde_json::Error),
-    #[error("missed a change, inconsistent state")]
-    MissedChange,
+    #[error("missed a change (expected: {expected}, got: {got}), inconsistent state")]
+    MissedChange { expected: ChangeId, got: ChangeId },
     #[error("max line length exceeded")]
     MaxLineLengthExceeded,
     #[error("initial query never finished")]
@@ -91,16 +92,19 @@ where
 {
     pub fn new(
         id: Uuid,
+        hash: Option<String>,
         client: hyper::Client<HttpConnector, Body>,
         api_addr: SocketAddr,
         body: hyper::Body,
+        change_id: Option<ChangeId>,
     ) -> Self {
         Self {
             id,
+            hash,
             client,
             api_addr,
-            observed_eoq: false,
-            last_change_id: None,
+            observed_eoq: change_id.is_some(),
+            last_change_id: change_id,
             stream: Some(FramedRead::new(
                 StreamReader::new(IoBodyStream { body }),
                 LinesBytesCodec::default(),
@@ -114,6 +118,14 @@ where
 
     pub fn id(&self) -> Uuid {
         self.id
+    }
+
+    pub fn hash(&self) -> Option<&str> {
+        self.hash.as_deref()
+    }
+
+    pub fn api_addr(&self) -> SocketAddr {
+        self.api_addr
     }
 
     fn poll_stream(
@@ -139,18 +151,34 @@ where
             Some(Ok(b)) => match serde_json::from_slice(&b) {
                 Ok(evt) => {
                     if let TypedQueryEvent::EndOfQuery { change_id, .. } = &evt {
-                        self.observed_eoq = true;
-                        self.last_change_id = *change_id;
+                        self.handle_eoq(*change_id);
                     }
+
                     if let TypedQueryEvent::Change(_, _, _, change_id) = &evt {
-                        if matches!(self.last_change_id, Some(id) if id.0 + 1 != change_id.0) {
-                            return Poll::Ready(Some(Err(SubscriptionError::MissedChange)));
+                        if let Err(e) = self.handle_change(*change_id) {
+                            return Poll::Ready(Some(Err(e)));
                         }
-                        self.last_change_id = Some(*change_id);
                     }
+
                     Poll::Ready(Some(Ok(evt)))
                 }
-                Err(e) => Poll::Ready(Some(Err(e.into()))),
+                Err(deser_err) => {
+                    // It failed to deserialize, try untyped variant to extract the metadata
+                    if let Ok(evt) = serde_json::from_slice::<QueryEvent>(&b) {
+                        if let TypedQueryEvent::EndOfQuery { change_id, .. } = &evt {
+                            self.handle_eoq(*change_id);
+                        }
+
+                        if let TypedQueryEvent::Change(_, _, _, change_id) = &evt {
+                            if let Err(e) = self.handle_change(*change_id) {
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                        }
+                    }
+
+                    // But return the original error anyway (unless this is out-of-order event)
+                    Poll::Ready(Some(Err(deser_err.into())))
+                }
             },
             Some(Err(e)) => match e {
                 LinesCodecError::MaxLineLengthExceeded => {
@@ -160,6 +188,27 @@ where
             },
             None => Poll::Ready(None),
         }
+    }
+
+    fn handle_eoq(&mut self, change_id: Option<ChangeId>) {
+        self.observed_eoq = true;
+        self.last_change_id = change_id;
+    }
+
+    fn handle_change(&mut self, change_id: ChangeId) -> Result<(), SubscriptionError> {
+        match self.last_change_id {
+            Some(id) if id + 1 != change_id => {
+                return Err(SubscriptionError::MissedChange {
+                    expected: id + 1,
+                    got: change_id,
+                })
+            }
+            _ => (),
+        }
+
+        self.last_change_id = Some(change_id);
+
+        Ok(())
     }
 
     fn poll_request(
@@ -225,18 +274,20 @@ where
         if let Some(backoff) = self.backoff.as_mut() {
             ready!(backoff.as_mut().poll(cx));
             self.backoff = None;
-            self.backoff_count = 0;
         }
 
         let io_err = match ready!(self.as_mut().poll_stream(cx)) {
             Some(Err(SubscriptionError::Io(io_err))) => io_err,
-            other => return Poll::Ready(other),
+            other => {
+                self.backoff_count = 0;
+                return Poll::Ready(other);
+            }
         };
 
         // reset the stream
         self.stream = None;
 
-        if self.backoff_count >= 30 {
+        if self.backoff_count >= 10 {
             return Poll::Ready(Some(Err(SubscriptionError::MaxRetryAttempts)));
         }
 
@@ -253,6 +304,66 @@ where
         self.backoff_count += 1;
 
         Poll::Pending
+    }
+}
+
+pub struct UpdatesStream<T> {
+    id: Uuid,
+    stream: FramedBody,
+    _deser: std::marker::PhantomData<T>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UpdatesError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Deserialize(#[from] serde_json::Error),
+    #[error("max line length exceeded")]
+    MaxLineLengthExceeded,
+}
+
+impl<T> UpdatesStream<T>
+where
+    T: DeserializeOwned + Unpin,
+{
+    pub fn new(id: Uuid, body: hyper::Body) -> Self {
+        Self {
+            id,
+            stream: FramedRead::new(
+                StreamReader::new(IoBodyStream { body }),
+                LinesBytesCodec::default(),
+            ),
+            _deser: Default::default(),
+        }
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+}
+
+impl<T> Stream for UpdatesStream<T>
+where
+    T: DeserializeOwned + Unpin,
+{
+    type Item = Result<TypedNotifyEvent<T>, UpdatesError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let res = ready!(Pin::new(&mut self.stream).poll_next(cx));
+        match res {
+            Some(Ok(b)) => match serde_json::from_slice(&b) {
+                Ok(evt) => Poll::Ready(Some(Ok(evt))),
+                Err(e) => Poll::Ready(Some(Err(e.into()))),
+            },
+            Some(Err(e)) => match e {
+                LinesCodecError::MaxLineLengthExceeded => {
+                    Poll::Ready(Some(Err(UpdatesError::MaxLineLengthExceeded)))
+                }
+                LinesCodecError::Io(io_err) => Poll::Ready(Some(Err(io_err.into()))),
+            },
+            None => Poll::Ready(None),
+        }
     }
 }
 

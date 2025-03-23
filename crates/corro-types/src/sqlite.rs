@@ -5,7 +5,7 @@ use std::{
 
 use once_cell::sync::Lazy;
 use rusqlite::{params, Connection, Transaction};
-use sqlite_pool::SqliteConn;
+use sqlite_pool::{Committable, SqliteConn};
 use tempfile::TempDir;
 use tracing::{error, info, trace};
 
@@ -40,7 +40,7 @@ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
 
 pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     init_cr_conn(&mut conn)?;
-    setup_conn(&mut conn)?;
+    setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
     Ok(CrConn(conn))
 }
@@ -88,6 +88,18 @@ impl Drop for CrConn {
     }
 }
 
+impl Committable for CrConn {
+    fn commit(self) -> Result<(), rusqlite::Error> {
+        Ok(())
+    }
+
+    fn savepoint(&mut self) -> Result<rusqlite::Savepoint<'_>, rusqlite::Error> {
+        Err(rusqlite::Error::ModuleError(String::from(
+            "cannot create savepoint from connection",
+        )))
+    }
+}
+
 fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     let ext_dir = &CRSQL_EXT_DIR;
     trace!(
@@ -108,15 +120,18 @@ fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-pub fn setup_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
     // WAL journal mode and synchronous NORMAL for best performance / crash resilience compromise
     conn.execute_batch(
         r#"
             PRAGMA journal_mode = WAL;
+            PRAGMA journal_size_limit = 1073741824;
             PRAGMA synchronous = NORMAL;
             PRAGMA recursive_triggers = ON;
         "#,
     )?;
+
+    rusqlite::vtab::series::load_module(conn)?;
 
     Ok(())
 }
@@ -125,7 +140,10 @@ pub trait Migration {
     fn migrate(&self, tx: &Transaction) -> rusqlite::Result<()>;
 }
 
-impl Migration for fn(&Transaction) -> rusqlite::Result<()> {
+impl<F> Migration for F
+where
+    F: Fn(&Transaction) -> rusqlite::Result<()>,
+{
     fn migrate(&self, tx: &Transaction) -> rusqlite::Result<()> {
         self(tx)
     }
@@ -178,6 +196,8 @@ pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> ru
 #[cfg(test)]
 mod tests {
     use futures::{stream::FuturesUnordered, TryStreamExt};
+    use sqlite_pool::Config;
+    use sqlite_pool::InterruptibleTransaction;
     use tokio::task::block_in_place;
 
     use super::*;
@@ -239,6 +259,52 @@ mod tests {
 
         assert_eq!(count, total * per_worker);
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_interruptible_transaction() -> Result<(), Box<dyn std::error::Error>> {
+        let tmpdir = tempfile::tempdir()?;
+
+        let path = tmpdir.path().join("db.sqlite");
+        let pool = Config::new(path)
+            .max_size(1)
+            .create_pool_transform(rusqlite_to_crsqlite)?;
+
+        let mut conn = pool.get().await.unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS testsbool (
+            id INTEGER NOT NULL PRIMARY KEY,
+            b boolean not null default false
+        ); SELECT crsql_as_crr('testsbool')",
+        )?;
+
+        {
+            let tx = conn.transaction()?;
+            let timeout = Some(tokio::time::Duration::from_millis(5));
+            let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
+            let res = itx.execute("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;", &[]);
+
+            assert!(res.is_err_and(
+                |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+            ));
+        }
+
+        {
+            let tx = conn.transaction()?;
+            let timeout = Some(tokio::time::Duration::from_millis(5));
+            let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
+            let res = itx.prepare_cached("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;")?
+                        .execute(());
+
+            assert!(res.is_err_and(
+                |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+            ));
+        }
+
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM testsbool;", (), |row| row.get(0))?;
+        assert_eq!(count, 0);
         Ok(())
     }
 

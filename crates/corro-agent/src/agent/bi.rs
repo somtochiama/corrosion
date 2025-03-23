@@ -46,7 +46,7 @@ pub fn spawn_bipayload_handler(
 
             counter!("corro.peer.stream.accept.total", "type" => "bi").increment(1);
 
-            debug!(
+            trace!(
                 "accepted a bidirectional stream from {}",
                 conn.remote_address()
             );
@@ -56,7 +56,7 @@ pub fn spawn_bipayload_handler(
                 let agent = agent.clone();
                 let bookie = bookie.clone();
                 async move {
-                    let mut framed = FramedRead::new(rx, LengthDelimitedCodec::new());
+                    let mut framed = FramedRead::new(rx, LengthDelimitedCodec::builder().max_frame_length(100 * 1_024 * 1_024).new_codec());
 
                     loop {
                         match timeout(Duration::from_secs(5), StreamExt::next(&mut framed)).await {

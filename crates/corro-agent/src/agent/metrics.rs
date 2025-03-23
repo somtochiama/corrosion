@@ -66,6 +66,34 @@ pub fn collect_metrics(agent: &Agent, transport: &Transport) {
         }
     }
 
+    match conn
+        .prepare_cached("select actor_id, sum((end - start) + 1) from __corro_bookkeeping_gaps group by actor_id")
+        .and_then(|mut prepped| {
+            prepped
+                .query_map((), |row| {
+                    Ok((row.get::<_, ActorId>(0)?, row.get::<_, u64>(1)?))
+                })
+                .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
+        }) {
+        Ok(mapped) => {
+            for (actor_id, sum) in mapped {
+                gauge!("corro.db.gaps.sum", "actor_id" => actor_id.to_string()).set(sum as f64)
+            }
+        }
+        Err(e) => {
+            error!("could not query sum for gaps: {e}");
+        }
+    }
+
+    match conn.pragma_query_value(None, "freelist_count", |row| row.get::<_, u64>(0)) {
+        Ok(n) => {
+            gauge!("corro.db.freelist.count").set(n as f64);
+        }
+        Err(e) => {
+            error!("could not query freelist_count in db: {e}");
+        }
+    }
+
     let mut db_path = agent.config().db.path.clone();
 
     if let Ok(meta) = db_path.metadata() {

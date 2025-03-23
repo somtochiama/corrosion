@@ -3,6 +3,7 @@ use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::{format_compact, ToCompactString};
+use corro_types::updates::Handle;
 use corro_types::{
     agent::Agent,
     api::{ChangeId, QueryEvent, QueryEventMeta, Statement},
@@ -14,7 +15,7 @@ use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::{
     sync::{
-        broadcast,
+        broadcast::{self, error::RecvError},
         mpsc::{self, error::TryRecvError},
         RwLock as TokioRwLock,
     },
@@ -74,7 +75,9 @@ async fn sub_by_id(
                 bcast_cache_write.remove(&id);
                 if let Some(handle) = subs.remove(&id) {
                     info!(sub_id = %id, "Removed subscription from sub_by_id");
-                    tokio::spawn(handle.cleanup());
+                    tokio::spawn(async move {
+                        handle.cleanup().await;
+                    });
                 }
 
                 return hyper::Response::builder()
@@ -93,6 +96,7 @@ async fn sub_by_id(
 
     let (evt_tx, evt_rx) = mpsc::channel(512);
 
+    let query_hash = matcher.hash().to_owned();
     tokio::spawn(catch_up_sub(matcher, params, rx, evt_tx));
 
     let (tx, body) = hyper::Body::channel();
@@ -102,6 +106,7 @@ async fn sub_by_id(
     hyper::Response::builder()
         .status(StatusCode::OK)
         .header("corro-query-id", id.to_string())
+        .header("corro-query-hash", query_hash)
         .body(body)
         .expect("could not build query response body")
 }
@@ -370,8 +375,11 @@ async fn catch_up_sub_anew(
     });
 
     let last_change_id = {
-        let conn = matcher.pool().get().await?;
-        block_in_place(|| matcher.all_rows(&conn, q_tx))?
+        let mut conn = matcher.pool().get().await?;
+        block_in_place(|| {
+            let conn_tx = conn.transaction()?;
+            matcher.all_rows(&conn_tx, q_tx)
+        })?
     };
 
     task.await??;
@@ -482,7 +490,7 @@ pub async fn catch_up_sub(
         }
     };
 
-    let min_change_id = last_change_id + 1;
+    let mut min_change_id = last_change_id + 1;
     info!(sub_id = %matcher.id(), "minimum expected change id: {min_change_id:?}");
 
     let mut pending_event = None;
@@ -519,7 +527,9 @@ pub async fn catch_up_sub(
     if let Some(change_id) = last_sub_change_id {
         debug!(sub_id = %matcher.id(), "got a change to check: {change_id:?}");
         for i in 0..5 {
-            if change_id > min_change_id {
+            min_change_id = last_change_id + 1;
+
+            if change_id >= min_change_id {
                 // missed some updates!
                 info!(sub_id = %matcher.id(), "attempt #{} to catch up subcription from change id: {change_id:?} (last: {last_change_id:?})", i+1);
 
@@ -542,7 +552,7 @@ pub async fn catch_up_sub(
             // sleep 100 millis
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if change_id > min_change_id {
+        if change_id >= min_change_id {
             _ = evt_tx
                 .send(error_to_query_event_bytes_with_meta(
                     &mut buf,
@@ -566,6 +576,8 @@ pub async fn catch_up_sub(
                 warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
                 return;
             }
+
+            last_change_id = change_id;
         }
     }
 
@@ -583,6 +595,8 @@ pub async fn catch_up_sub(
                 warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
                 return;
             }
+
+            last_change_id = change_id;
         }
     }
 
@@ -692,6 +706,7 @@ pub async fn api_v1_subs(
         tripwire,
     ));
 
+    let query_hash = handle.hash().to_owned();
     let matcher_id = match upsert_sub(
         handle,
         maybe_created,
@@ -709,6 +724,7 @@ pub async fn api_v1_subs(
     hyper::Response::builder()
         .status(StatusCode::OK)
         .header("corro-query-id", matcher_id.to_string())
+        .header("corro-query-hash", query_hash)
         .body(body)
         .expect("could not generate ok http response for query request")
 }
@@ -725,17 +741,23 @@ async fn forward_sub_to_sender(
 
     loop {
         let (event_buf, meta) = tokio::select! {
-            Ok((event_buf, meta)) = sub_rx.recv() => {
-                (event_buf, meta)
+            res = sub_rx.recv() => {
+                match res {
+                    Ok((event_buf, meta)) => (event_buf, meta),
+                    Err(RecvError::Lagged(skipped)) => {
+                        warn!(sub_id = %handle.id(), "subscription skipped {} events, aborting", skipped);
+                        return;
+                    },
+                    Err(RecvError::Closed) => {
+                        info!(sub_id = %handle.id(), "events subcription ran out");
+                        return;
+                    },
+                }
             },
             _ = handle.cancelled() => {
                 info!(sub_id = %handle.id(), "subscription cancelled, aborting forwarding bytes to subscriber");
                 return;
             },
-            else => {
-                info!(sub_id = %handle.id(), "events subcription ran out");
-                return;
-            }
         };
 
         if skip_rows
@@ -753,6 +775,39 @@ async fn forward_sub_to_sender(
     }
 }
 
+async fn handle_sub_event(
+    sub_id: Uuid,
+    buf: &mut BytesMut,
+    event_buf: Bytes,
+    meta: QueryEventMeta,
+    tx: &mut hyper::body::Sender,
+    last_change_id: &mut ChangeId,
+) -> hyper::Result<()> {
+    match meta {
+        QueryEventMeta::EndOfQuery(Some(change_id)) | QueryEventMeta::Change(change_id) => {
+            if !last_change_id.is_zero() && change_id > *last_change_id + 1 {
+                warn!(%sub_id, "non-contiguous change id (> + 1) received: {change_id:?}, last seen: {last_change_id:?}");
+            } else if !last_change_id.is_zero() && change_id == *last_change_id {
+                warn!(%sub_id, "duplicate change id received: {change_id:?}, last seen: {last_change_id:?}");
+            } else if change_id < *last_change_id {
+                warn!(%sub_id, "smaller change id received: {change_id:?}, last seen: {last_change_id:?}");
+            }
+            *last_change_id = change_id;
+        }
+        _ => {
+            // do nothing
+        }
+    }
+    buf.extend_from_slice(&event_buf);
+    let to_send = if buf.len() >= 64 * 1024 {
+        buf.split().freeze()
+    } else {
+        return Ok(());
+    };
+
+    tx.send_data(to_send).await
+}
+
 async fn forward_bytes_to_body_sender(
     sub_id: Uuid,
     mut rx: mpsc::Receiver<(Bytes, QueryEventMeta)>,
@@ -767,35 +822,25 @@ async fn forward_bytes_to_body_sender(
     let mut last_change_id = ChangeId(0);
 
     loop {
-        let to_send = tokio::select! {
+        tokio::select! {
             biased;
-            Some((event_buf, meta)) = rx.recv() => {
-                match meta {
-                    QueryEventMeta::EndOfQuery(Some(change_id)) |
-                    QueryEventMeta::Change(change_id) => {
-                        if !last_change_id.is_zero() && change_id > last_change_id + 1 {
-                            warn!(%sub_id, "non-contiguous change id (> + 1) received: {change_id:?}, last seen: {last_change_id:?}");
-                        } else if !last_change_id.is_zero() && change_id == last_change_id {
-                            warn!(%sub_id, "duplicate change id received: {change_id:?}, last seen: {last_change_id:?}");
-                        } else if change_id < last_change_id {
-                            warn!(%sub_id, "smaller change id received: {change_id:?}, last seen: {last_change_id:?}");
+            res = rx.recv() => {
+                match res {
+                    Some((event_buf, meta)) => {
+                        if let Err(e) = handle_sub_event(sub_id, &mut buf, event_buf, meta, &mut tx, &mut last_change_id).await {
+                            warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
+                            return;
                         }
-                        last_change_id = change_id;
                     },
-                    _ => {
-                        // do nothing
-                    }
-                }
-                buf.extend_from_slice(&event_buf);
-                if buf.len() >= 64*1024 {
-                    buf.split().freeze()
-                } else {
-                    continue;
+                    None => break,
                 }
             },
             _ = &mut send_deadline => {
                 if !buf.is_empty() {
-                    buf.split().freeze()
+                    if let Err(e) = tx.send_data(buf.split().freeze()).await {
+                        warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
+                        return;
+                    }
                 } else {
                     if let Err(e) = poll_fn(|cx| tx.poll_ready(cx)).await {
                         warn!(%sub_id, error = %e, "body sender was closed or errored, stopping event broadcast sends");
@@ -808,14 +853,25 @@ async fn forward_bytes_to_body_sender(
             _ = &mut tripwire => {
                 break;
             }
-            else => break,
-        };
+        }
+    }
 
-        if let Err(e) = tx.send_data(to_send).await {
+    while let Ok((event_buf, meta)) = rx.try_recv() {
+        if let Err(e) = handle_sub_event(
+            sub_id,
+            &mut buf,
+            event_buf,
+            meta,
+            &mut tx,
+            &mut last_change_id,
+        )
+        .await
+        {
             warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
             return;
         }
     }
+
     if !buf.is_empty() {
         if let Err(e) = tx.send_data(buf.freeze()).await {
             warn!(%sub_id, "could not forward last subscription query event to receiver: {e}");
@@ -825,21 +881,37 @@ async fn forward_bytes_to_body_sender(
 
 #[cfg(test)]
 mod tests {
+    use corro_types::actor::ActorId;
+    use corro_types::api::NotifyEvent;
+    use corro_types::api::{ColumnName, TableName};
+    use corro_types::base::{CrsqlDbVersion, CrsqlSeq, Version};
+    use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
+    use corro_types::change::Change;
+    use corro_types::pubsub::pack_columns;
     use corro_types::{
         api::{ChangeId, RowId},
         config::Config,
         pubsub::ChangeType,
     };
     use http_body::Body;
+    use serde::de::DeserializeOwned;
+    use spawn::wait_for_all_pending_handles;
+    use std::ops::RangeInclusive;
+    use std::time::Instant;
+    use tokio::time::timeout;
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
 
+    use super::*;
+    use crate::agent::process_multiple_changes;
+    use crate::api::public::update::{api_v1_updates, SharedUpdateBroadcastCache};
+    use crate::api::public::TransactionParams;
     use crate::{
         agent::setup,
         api::public::{api_v1_db_schema, api_v1_transactions},
     };
-
-    use super::*;
+    use corro_tests::launch_test_agent;
+    use corro_types::api::SqliteValue::Integer;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_v1_subs() -> eyre::Result<()> {
@@ -869,6 +941,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TransactionParams { timeout: None }),
             axum::Json(vec![
                 Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
@@ -887,6 +960,7 @@ mod tests {
         assert!(body.0.results.len() == 2);
 
         let bcast_cache: SharedMatcherBroadcastCache = Default::default();
+        let update_bcast_cache: SharedUpdateBroadcastCache = Default::default();
 
         {
             let mut res = api_v1_subs(
@@ -906,8 +980,26 @@ mod tests {
 
             assert_eq!(res.status(), StatusCode::OK);
 
+            // only want notifications
+            let mut notify_res = api_v1_updates(
+                Extension(agent.clone()),
+                Extension(update_bcast_cache.clone()),
+                Extension(tripwire.clone()),
+                axum::extract::Path("tests".to_string()),
+            )
+            .await
+            .into_response();
+
+            if !notify_res.status().is_success() {
+                let b = notify_res.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(notify_res.status(), StatusCode::OK);
+
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id-3".into(), "service-name-3".into()],
@@ -924,18 +1016,25 @@ mod tests {
                 done: false,
             };
 
+            let mut notify_rows = RowsIter {
+                body: notify_res.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
+
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Columns(vec!["id".into(), "text".into()])
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(
                     RowId(2),
                     vec!["service-id-2".into(), "service-name-2".into()]
@@ -943,12 +1042,12 @@ mod tests {
             );
 
             assert!(matches!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::EndOfQuery { .. }
             ));
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Change(
                     ChangeType::Insert,
                     RowId(3),
@@ -959,6 +1058,7 @@ mod tests {
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id-4".into(), "service-name-4".into()],
@@ -969,13 +1069,23 @@ mod tests {
             assert_eq!(status_code, StatusCode::OK);
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Change(
                     ChangeType::Insert,
                     RowId(4),
                     vec!["service-id-4".into(), "service-name-4".into()],
                     ChangeId(2)
                 )
+            );
+
+            assert_eq!(
+                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                NotifyEvent::Notify(ChangeType::Update, vec!["service-id-3".into()],)
+            );
+
+            assert_eq!(
+                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                NotifyEvent::Notify(ChangeType::Update, vec!["service-id-4".into()],)
             );
 
             let mut res = api_v1_subs(
@@ -1006,7 +1116,7 @@ mod tests {
             };
 
             assert_eq!(
-                rows_from.recv().await.unwrap().unwrap(),
+                rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Change(
                     ChangeType::Insert,
                     RowId(4),
@@ -1015,8 +1125,33 @@ mod tests {
                 )
             );
 
+            // new subscriber for updates
+            let mut notify_res2 = api_v1_updates(
+                Extension(agent.clone()),
+                Extension(update_bcast_cache.clone()),
+                Extension(tripwire.clone()),
+                axum::extract::Path("tests".to_string()),
+            )
+            .await
+            .into_response();
+
+            if !notify_res2.status().is_success() {
+                let b = notify_res2.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(notify_res2.status(), StatusCode::OK);
+
+            let mut notify_rows2 = RowsIter {
+                body: notify_res2.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
+
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id-5".into(), "service-name-5".into()],
@@ -1033,9 +1168,24 @@ mod tests {
                 ChangeId(3),
             );
 
-            assert_eq!(rows.recv().await.unwrap().unwrap(), query_evt);
+            assert_eq!(rows.recv::<QueryEvent>().await.unwrap().unwrap(), query_evt);
 
-            assert_eq!(rows_from.recv().await.unwrap().unwrap(), query_evt);
+            assert_eq!(
+                rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
+                query_evt
+            );
+
+            let notify_evt = NotifyEvent::Notify(ChangeType::Update, vec!["service-id-5".into()]);
+
+            assert_eq!(
+                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                notify_evt
+            );
+
+            assert_eq!(
+                notify_rows2.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                notify_evt
+            );
 
             // subscriber who arrives later!
 
@@ -1064,17 +1214,17 @@ mod tests {
             };
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Columns(vec!["id".into(), "text".into()])
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(
                     RowId(2),
                     vec!["service-id-2".into(), "service-name-2".into()]
@@ -1082,7 +1232,7 @@ mod tests {
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(
                     RowId(3),
                     vec!["service-id-3".into(), "service-name-3".into()],
@@ -1090,7 +1240,7 @@ mod tests {
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(
                     RowId(4),
                     vec!["service-id-4".into(), "service-name-4".into()],
@@ -1098,11 +1248,45 @@ mod tests {
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(
                     RowId(5),
                     vec!["service-id-5".into(), "service-name-5".into()]
                 )
+            );
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-6".into(), "service-name-6".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
+                axum::Json(vec![Statement::WithParams(
+                    "delete from  tests where id = ?".into(),
+                    vec!["service-id-6".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            assert_eq!(
+                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                NotifyEvent::Notify(ChangeType::Update, vec!["service-id-6".into()],)
+            );
+
+            assert_eq!(
+                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                NotifyEvent::Notify(ChangeType::Delete, vec!["service-id-6".into()],)
             );
         }
 
@@ -1136,7 +1320,7 @@ mod tests {
         };
 
         assert_eq!(
-            rows_from.recv().await.unwrap().unwrap(),
+            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(4),
@@ -1146,7 +1330,7 @@ mod tests {
         );
 
         assert_eq!(
-            rows_from.recv().await.unwrap().unwrap(),
+            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(5),
@@ -1186,6 +1370,7 @@ mod tests {
 
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TransactionParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "insert into tests (id, text) values (?,?)".into(),
                 vec!["service-id-6".into(), "service-name-6".into()],
@@ -1196,7 +1381,7 @@ mod tests {
         assert_eq!(status_code, StatusCode::OK);
 
         assert_eq!(
-            rows_from.recv().await.unwrap().unwrap(),
+            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(6),
@@ -1235,7 +1420,7 @@ mod tests {
         };
 
         assert_eq!(
-            rows_from.recv().await.unwrap().unwrap(),
+            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(6),
@@ -1243,6 +1428,237 @@ mod tests {
                 ChangeId(4),
             )
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn match_buffered_changes() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+        let tx_timeout = Duration::from_secs(60);
+
+        let schema = "CREATE TABLE buftests (
+            pk int NOT NULL PRIMARY KEY,
+            col1 text,
+            col2 text
+         );";
+
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(ta1.agent.clone()),
+            axum::Json(vec![schema.into()]),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK);
+
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+
+        let change1 = Change {
+            table: TableName("buftests".into()),
+            pk: pack_columns(&vec![1i64.into()])?,
+            cid: ColumnName("col1".into()),
+            val: "one".into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(0),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        let change2 = Change {
+            table: TableName("buftests".into()),
+            pk: pack_columns(&vec![1i64.into()])?,
+            cid: ColumnName("col2".into()),
+            val: "one line".into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(1),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        let changes = ChangeV1 {
+            actor_id,
+            changeset: Changeset::Full {
+                version: Version(1),
+                changes: vec![change1, change2],
+                seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(1)),
+                last_seq: CrsqlSeq(1),
+                ts: Default::default(),
+            },
+        };
+
+        process_multiple_changes(
+            ta1.agent.clone(),
+            ta1.bookie.clone(),
+            vec![(changes, ChangeSource::Sync, Instant::now())],
+            tx_timeout,
+        )
+        .await?;
+
+        let bcast_cache: SharedMatcherBroadcastCache = Default::default();
+        let update_bcast_cache: SharedUpdateBroadcastCache = Default::default();
+        let mut res = api_v1_subs(
+            Extension(ta1.agent.clone()),
+            Extension(bcast_cache.clone()),
+            Extension(tripwire.clone()),
+            axum::extract::Query(SubParams::default()),
+            axum::Json(Statement::Simple("select * from buftests".into())),
+        )
+        .await
+        .into_response();
+
+        if !res.status().is_success() {
+            let b = res.body_mut().data().await.unwrap().unwrap();
+            println!("body: {}", String::from_utf8_lossy(&b));
+        }
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // only notifications
+        let mut notify_res = api_v1_updates(
+            Extension(ta1.agent.clone()),
+            Extension(update_bcast_cache.clone()),
+            Extension(tripwire.clone()),
+            axum::extract::Path("buftests".to_string()),
+        )
+        .await
+        .into_response();
+
+        if !notify_res.status().is_success() {
+            let b = notify_res.body_mut().data().await.unwrap().unwrap();
+            println!("body: {}", String::from_utf8_lossy(&b));
+        }
+
+        assert_eq!(notify_res.status(), StatusCode::OK);
+
+        let mut notify_rows = RowsIter {
+            body: notify_res.into_body(),
+            codec: LinesCodec::new(),
+            buf: BytesMut::new(),
+            done: false,
+        };
+
+        let mut rows = RowsIter {
+            body: res.into_body(),
+            codec: LinesCodec::new(),
+            buf: BytesMut::new(),
+            done: false,
+        };
+
+        assert_eq!(
+            rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Columns(vec!["pk".into(), "col1".into(), "col2".into()])
+        );
+
+        assert_eq!(
+            rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Row(RowId(1), vec![Integer(1), "one".into(), "one line".into()])
+        );
+
+        assert!(matches!(
+            rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::EndOfQuery { .. }
+        ));
+
+        // send partial change so it is buffered
+        let change3 = Change {
+            table: TableName("buftests".into()),
+            pk: pack_columns(&vec![2i64.into()])?,
+            cid: ColumnName("col1".into()),
+            val: "two".into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(0),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        let changes = ChangeV1 {
+            actor_id,
+            changeset: Changeset::Full {
+                version: Version(2),
+                changes: vec![change3],
+                seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(0)),
+                last_seq: CrsqlSeq(1),
+                ts: Default::default(),
+            },
+        };
+
+        process_multiple_changes(
+            ta1.agent.clone(),
+            ta1.bookie.clone(),
+            vec![(changes, ChangeSource::Sync, Instant::now())],
+            tx_timeout,
+        )
+        .await?;
+
+        // confirm that change is buffered in db
+        {
+            let conn = ta1.agent.pool().read().await?;
+            let end = conn.query_row(
+                "SELECT end_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
+                (actor_id, 2),
+                |row| row.get::<_, CrsqlSeq>(0),
+            )?;
+            assert_eq!(end, CrsqlSeq(0));
+        }
+
+        let change4 = Change {
+            table: TableName("buftests".into()),
+            pk: pack_columns(&vec![2i64.into()])?,
+            cid: ColumnName("col2".into()),
+            val: "two line".into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(1),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        let changes = ChangeV1 {
+            actor_id,
+            changeset: Changeset::Full {
+                version: Version(2),
+                changes: vec![change4],
+                seqs: RangeInclusive::new(CrsqlSeq(1), CrsqlSeq(1)),
+                last_seq: CrsqlSeq(1),
+                ts: Default::default(),
+            },
+        };
+
+        process_multiple_changes(
+            ta1.agent.clone(),
+            ta1.bookie.clone(),
+            vec![(changes, ChangeSource::Sync, Instant::now())],
+            tx_timeout,
+        )
+        .await?;
+
+        let res = timeout(Duration::from_secs(5), rows.recv::<QueryEvent>()).await?;
+
+        assert_eq!(
+            res.unwrap().unwrap(),
+            QueryEvent::Change(
+                ChangeType::Insert,
+                RowId(2),
+                vec![Integer(2), "two".into(), "two line".into()],
+                ChangeId(1)
+            )
+        );
+
+        let notify_res = timeout(Duration::from_secs(5), notify_rows.recv::<NotifyEvent>()).await?;
+        assert_eq!(
+            notify_res.unwrap().unwrap(),
+            NotifyEvent::Notify(ChangeType::Update, vec![Integer(2)],)
+        );
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
 
         Ok(())
     }
@@ -1255,7 +1671,7 @@ mod tests {
     }
 
     impl RowsIter {
-        async fn recv(&mut self) -> Option<eyre::Result<QueryEvent>> {
+        async fn recv<T: DeserializeOwned>(&mut self) -> Option<eyre::Result<T>> {
             if self.done {
                 return None;
             }

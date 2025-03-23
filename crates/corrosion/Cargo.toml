@@ -1,6 +1,6 @@
 [package]
 name = "corrosion"
-version = "0.1.0"
+version = "0.2.0-beta.0"
 edition = "2021"
 
 [dependencies]
@@ -37,6 +37,7 @@ shellwords = { version = "1" }
 spawn = { path = "../spawn" }
 sqlite3-restore = { path = "../sqlite3-restore" }
 tempfile = { workspace = true }
+thiserror = { workspace = true }
 tikv-jemallocator = "0.5"
 time = { workspace = true }
 tokio = { workspace = true }
@@ -49,6 +50,8 @@ tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
 uuid = { workspace = true }
+shell-words = "1.1.0"
+metrics-util = { workspace = true }
 
 [build-dependencies]
 build-info-build = { workspace = true }

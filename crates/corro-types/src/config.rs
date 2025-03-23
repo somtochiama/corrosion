@@ -2,12 +2,21 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
+use serde_with::{formats::PreferOne, serde_as, OneOrMany};
 
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
 
 const fn default_apply_queue() -> usize {
-    600
+    50
+}
+
+const fn default_wal_threshold() -> usize {
+    10
+}
+
+const fn default_processing_queue() -> usize {
+    20000
 }
 
 /// Used for the apply channel
@@ -29,7 +38,11 @@ const fn default_small_channel() -> usize {
 }
 
 const fn default_apply_timeout() -> usize {
-    50
+    10
+}
+
+fn default_sql_tx_timeout() -> usize {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,8 +107,6 @@ pub struct DbConfig {
     pub schema_paths: Vec<Utf8PathBuf>,
     #[serde(default)]
     pub subscriptions_path: Option<Utf8PathBuf>,
-    #[serde(default)]
-    pub clear_overwritten_secs: Option<u64>,
 }
 
 impl DbConfig {
@@ -112,10 +123,12 @@ impl DbConfig {
     }
 }
 
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     #[serde(alias = "addr")]
-    pub bind_addr: SocketAddr,
+    #[serde_as(deserialize_as = "OneOrMany<_, PreferOne>")]
+    pub bind_addr: Vec<SocketAddr>,
     #[serde(alias = "authz", default)]
     pub authorization: Option<AuthzConfig>,
     #[serde(default)]
@@ -126,6 +139,17 @@ pub struct ApiConfig {
 pub struct PgConfig {
     #[serde(alias = "addr")]
     pub bind_addr: SocketAddr,
+    pub tls: Option<PgTlsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PgTlsConfig {
+    pub cert_file: Utf8PathBuf,
+    pub key_file: Utf8PathBuf,
+    #[serde(default)]
+    pub ca_file: Option<Utf8PathBuf>,
+    #[serde(default)]
+    pub verify_client: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +204,12 @@ pub struct PerfConfig {
     pub apply_queue_timeout: usize,
     #[serde(default = "default_apply_queue")]
     pub apply_queue_len: usize,
+    #[serde(default = "default_wal_threshold")]
+    pub wal_threshold_gb: usize,
+    #[serde(default = "default_processing_queue")]
+    pub processing_queue_len: usize,
+    #[serde(default = "default_sql_tx_timeout")]
+    pub sql_tx_timeout: usize,
 }
 
 impl Default for PerfConfig {
@@ -196,6 +226,9 @@ impl Default for PerfConfig {
             foca_channel_len: default_small_channel(),
             apply_queue_timeout: default_apply_timeout(),
             apply_queue_len: default_apply_queue(),
+            wal_threshold_gb: default_wal_threshold(),
+            processing_queue_len: default_processing_queue(),
+            sql_tx_timeout: default_sql_tx_timeout(),
         }
     }
 }
@@ -280,7 +313,7 @@ impl Config {
 pub struct ConfigBuilder {
     pub db_path: Option<Utf8PathBuf>,
     gossip_addr: Option<SocketAddr>,
-    api_addr: Option<SocketAddr>,
+    api_addr: Vec<SocketAddr>,
     external_addr: Option<SocketAddr>,
     admin_path: Option<Utf8PathBuf>,
     prometheus_addr: Option<SocketAddr>,
@@ -305,12 +338,7 @@ impl ConfigBuilder {
     }
 
     pub fn api_addr(mut self, addr: SocketAddr) -> Self {
-        self.api_addr = Some(addr);
-        self
-    }
-
-    pub fn external_addr(mut self, addr: SocketAddr) -> Self {
-        self.external_addr = Some(addr);
+        self.api_addr.push(addr);
         self
     }
 
@@ -364,15 +392,18 @@ impl ConfigBuilder {
             open_telemetry: None,
         };
 
+        if self.api_addr.is_empty() {
+            return Err(ConfigBuilderError::ApiAddrRequired);
+        }
+
         Ok(Config {
             db: DbConfig {
                 path: db_path,
                 schema_paths: self.schema_paths,
                 subscriptions_path: None,
-                clear_overwritten_secs: None,
             },
             api: ApiConfig {
-                bind_addr: self.api_addr.ok_or(ConfigBuilderError::ApiAddrRequired)?,
+                bind_addr: self.api_addr,
                 authorization: None,
                 pg: None,
             },

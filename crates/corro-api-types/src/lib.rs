@@ -7,10 +7,9 @@ use std::{
 };
 
 use compact_str::CompactString;
-use corro_base_types::{CrsqlDbVersion, CrsqlSeq};
 use rusqlite::{
     types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
-    Row, ToSql,
+    ToSql,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -56,6 +55,16 @@ pub enum QueryEventMeta {
     EndOfQuery(Option<ChangeId>),
     Change(ChangeId),
     Error,
+    Notify,
+}
+
+pub type NotifyEvent = TypedNotifyEvent<Vec<SqliteValue>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TypedNotifyEvent<T> {
+    Notify(ChangeType, T),
+    Error(CompactString),
 }
 
 /// RowId newtype to differentiate from ChangeId
@@ -210,6 +219,7 @@ impl From<&str> for Statement {
 pub struct ExecResponse {
     pub results: Vec<ExecResult>,
     pub time: f64,
+    pub version: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -228,51 +238,6 @@ pub struct TableStatRequest {
 pub struct TableStatResponse {
     pub total_row_count: i64,
     pub invalid_tables: Vec<String>,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
-pub struct Change {
-    pub table: TableName,
-    pub pk: Vec<u8>,
-    pub cid: ColumnName,
-    pub val: SqliteValue,
-    pub col_version: i64,
-    pub db_version: CrsqlDbVersion,
-    pub seq: CrsqlSeq,
-    pub site_id: [u8; 16],
-    pub cl: i64,
-}
-
-impl Change {
-    // this is an ESTIMATE, it should give a rough idea of how many bytes will
-    // be required on the wire
-    pub fn estimated_byte_size(&self) -> usize {
-        self.table.len() + self.pk.len() + self.cid.len() + self.val.estimated_byte_size() +
-        // col_version
-        8 +
-        // db_version
-        8 +
-        // seq
-        8 +
-        // site_id
-        16 +
-        // cl
-        8
-    }
-}
-
-pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
-    Ok(Change {
-        table: row.get(0)?,
-        pk: row.get(1)?,
-        cid: row.get(2)?,
-        val: row.get(3)?,
-        col_version: row.get(4)?,
-        db_version: row.get(5)?,
-        seq: row.get(6)?,
-        site_id: row.get(7)?,
-        cl: row.get(8)?,
-    })
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -593,6 +558,12 @@ impl From<u16> for SqliteValue {
 impl From<i64> for SqliteValue {
     fn from(value: i64) -> Self {
         Self::Integer(value)
+    }
+}
+
+impl From<f64> for SqliteValue {
+    fn from(value: f64) -> Self {
+        Self::Real(Real(value))
     }
 }
 

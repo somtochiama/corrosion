@@ -5,16 +5,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use bytes::{Buf, BufMut};
 use camino::{Utf8Path, Utf8PathBuf};
 use compact_str::{format_compact, ToCompactString};
 use corro_api_types::{
-    Change, ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
+    ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
 };
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
-use metrics::counter;
+use metrics::{counter, histogram};
 use parking_lot::{Condvar, Mutex, RwLock};
 use rusqlite::{
     params_from_iter,
@@ -43,10 +44,13 @@ use crate::{
     agent::SplitPool,
     api::QueryEvent,
     base::CrsqlDbVersion,
+    change::Change,
     schema::{Schema, Table},
     sqlite::CrConn,
+    updates::HandleMetrics,
 };
 
+use crate::updates::{Handle, Manager};
 pub use corro_api_types::sqlite::ChangeType;
 
 #[derive(Debug, Default, Clone)]
@@ -58,12 +62,31 @@ struct InnerSubsManager {
     queries: HashMap<String, Uuid>,
 }
 
-// tools to bootstrap a new subscriber
+// tools to bootstrap a new subscriber or notifier
 pub struct MatcherCreated {
     pub evt_rx: mpsc::Receiver<QueryEvent>,
 }
 
 const SUB_EVENT_CHANNEL_CAP: usize = 512;
+
+impl Manager<MatcherHandle> for SubsManager {
+    fn trait_type(&self) -> String {
+        "subs".to_string()
+    }
+
+    fn get(&self, id: &Uuid) -> Option<MatcherHandle> {
+        self.0.read().get(id)
+    }
+
+    fn remove(&self, id: &Uuid) -> Option<MatcherHandle> {
+        let mut inner = self.0.write();
+        inner.remove(id)
+    }
+
+    fn get_handles(&self) -> BTreeMap<Uuid, MatcherHandle> {
+        self.0.read().handles.clone()
+    }
+}
 
 impl SubsManager {
     pub fn get(&self, id: &Uuid) -> Option<MatcherHandle> {
@@ -72,6 +95,14 @@ impl SubsManager {
 
     pub fn get_by_query(&self, sql: &str) -> Option<MatcherHandle> {
         self.0.read().get_by_query(sql)
+    }
+
+    pub fn get_by_hash(&self, hash: &str) -> Option<MatcherHandle> {
+        self.0.read().get_by_hash(hash)
+    }
+
+    pub fn get_handles(&self) -> BTreeMap<Uuid, MatcherHandle> {
+        self.0.read().handles.clone()
     }
 
     pub fn get_or_insert(
@@ -158,66 +189,14 @@ impl SubsManager {
         let mut inner = self.0.write();
         inner.remove(id)
     }
-
-    pub fn match_changes(&self, changes: &[Change], db_version: CrsqlDbVersion) {
-        trace!(
-            %db_version,
-            "trying to match changes to subscribers, len: {}",
-            changes.len()
-        );
-        if changes.is_empty() {
-            return;
-        }
-        let handles = {
-            let inner = self.0.read();
-            if inner.handles.is_empty() {
-                return;
-            }
-            inner.handles.clone()
-        };
-
-        for (id, handle) in handles.iter() {
-            trace!(sub_id = %id, %db_version, "attempting to match changes to a subscription");
-            let mut candidates = MatchCandidates::new();
-            let mut match_count = 0;
-            for change in changes.iter().map(MatchableChange::from) {
-                if handle.filter_matchable_change(&mut candidates, change) {
-                    match_count += 1;
-                }
-            }
-
-            // metrics...
-            for (table, pks) in candidates.iter() {
-                counter!("corro.subs.changes.matched.count", "sql_hash" => handle.inner.hash.clone(), "table" => table.to_string()).increment(pks.len() as u64);
-            }
-
-            trace!(sub_id = %id, %db_version, "found {match_count} candidates");
-
-            if let Err(e) = handle.inner.changes_tx.try_send((candidates, db_version)) {
-                error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
-                match e {
-                    mpsc::error::TrySendError::Full(item) => {
-                        warn!("channel is full, falling back to async send");
-                        let changes_tx = handle.inner.changes_tx.clone();
-                        tokio::spawn(async move {
-                            _ = changes_tx.send(item).await;
-                        });
-                    }
-                    mpsc::error::TrySendError::Closed(_) => {
-                        if let Some(handle) = self.remove(id) {
-                            tokio::spawn(handle.cleanup());
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
-struct MatchableChange<'a> {
-    table: &'a TableName,
-    pk: &'a [u8],
-    column: &'a ColumnName,
+#[derive(Debug)]
+pub struct MatchableChange<'a> {
+    pub table: &'a TableName,
+    pub pk: &'a [u8],
+    pub column: &'a ColumnName,
+    pub cl: i64,
 }
 
 impl<'a> From<&'a Change> for MatchableChange<'a> {
@@ -226,6 +205,7 @@ impl<'a> From<&'a Change> for MatchableChange<'a> {
             table: &value.table,
             pk: &value.pk,
             column: &value.cid,
+            cl: value.cl,
         }
     }
 }
@@ -239,6 +219,13 @@ impl InnerSubsManager {
         self.queries
             .get(sql)
             .and_then(|id| self.handles.get(id).cloned())
+    }
+
+    pub fn get_by_hash(&self, hash: &str) -> Option<MatcherHandle> {
+        self.handles
+            .values()
+            .find(|x| x.inner.hash == hash)
+            .cloned()
     }
 
     fn remove(&mut self, id: &Uuid) -> Option<MatcherHandle> {
@@ -277,13 +264,90 @@ struct InnerMatcherHandle {
     cancel: CancellationToken,
     changes_tx: mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>,
     last_change_rx: watch::Receiver<ChangeId>,
+    // some state from the matcher so we can take a look later
+    subs_path: String,
+    cached_statements: HashMap<String, MatcherStmt>,
+    metrics: HashMap<String, HandleMetrics>,
 }
 
-type MatchCandidates = IndexMap<TableName, IndexSet<Vec<u8>>>;
+pub type MatchCandidates = IndexMap<TableName, IndexMap<Vec<u8>, i64>>;
+
+#[async_trait]
+impl Handle for MatcherHandle {
+    fn id(&self) -> Uuid {
+        self.inner.id
+    }
+
+    fn cancelled(&self) -> WaitForCancellationFuture {
+        self.inner.cancel.cancelled()
+    }
+
+    fn changes_tx(&self) -> mpsc::Sender<(MatchCandidates, CrsqlDbVersion)> {
+        self.inner.changes_tx.clone()
+    }
+
+    async fn cleanup(&self) {
+        self.inner.cancel.cancel();
+        info!(sub_id = %self.inner.id, "Canceled subscription");
+    }
+
+    fn filter_matchable_change(
+        &self,
+        candidates: &mut MatchCandidates,
+        change: MatchableChange,
+    ) -> bool {
+        trace!("filtering change {change:?}");
+        // don't double process the same pk
+        if candidates
+            .get(change.table)
+            .map(|pks| pks.contains_key(change.pk))
+            .unwrap_or_default()
+        {
+            trace!("already contained key");
+            return false;
+        }
+
+        // don't consider changes that don't have both the table + col in the matcher query
+        if !self
+            .inner
+            .parsed
+            .table_columns
+            .get(change.table.as_str())
+            .map(|cols| change.column.is_crsql_sentinel() || cols.contains(change.column.as_str()))
+            .unwrap_or_default()
+        {
+            trace!("could not match against parsed query table and columns");
+            return false;
+        }
+
+        if let Some(v) = candidates.get_mut(change.table) {
+            v.insert(change.pk.to_vec(), change.cl).is_none()
+        } else {
+            candidates.insert(
+                change.table.clone(),
+                [(change.pk.to_vec(), change.cl)].into(),
+            );
+            true
+        }
+    }
+
+    fn get_counter(&self, table: &str) -> &HandleMetrics {
+        self.inner.metrics.get(table).unwrap_or_else(|| {
+            panic!(
+                "metrics counter for table '{}' missing. subs hash {}!",
+                self.inner.hash, table
+            )
+        })
+    }
+}
 
 impl MatcherHandle {
-    pub fn id(&self) -> Uuid {
-        self.inner.id
+    pub fn sql(&self) -> &String {
+        &self.inner.sql
+    }
+
+    pub fn hash(&self) -> &str {
+        &self.inner.hash
     }
 
     pub fn parsed_columns(&self) -> &[ResultColumn] {
@@ -294,9 +358,12 @@ impl MatcherHandle {
         &self.inner.col_names
     }
 
-    pub async fn cleanup(self) {
-        self.inner.cancel.cancel();
-        info!(sub_id = %self.inner.id, "Canceled subscription");
+    pub fn subs_path(&self) -> &String {
+        &self.inner.subs_path
+    }
+
+    pub fn cached_stmts(&self) -> &HashMap<String, MatcherStmt> {
+        &self.inner.cached_statements
     }
 
     pub fn pool(&self) -> &RusqlitePool {
@@ -309,10 +376,6 @@ impl MatcherHandle {
         while !state.is_running() {
             cvar.wait(&mut state);
         }
-    }
-
-    pub fn cancelled(&self) -> WaitForCancellationFuture {
-        self.inner.cancel.cancelled()
     }
 
     pub fn max_change_id(&self, conn: &Connection) -> rusqlite::Result<ChangeId> {
@@ -437,40 +500,6 @@ impl MatcherHandle {
 
         Ok(max_change_id)
     }
-
-    fn filter_matchable_change(
-        &self,
-        candidates: &mut MatchCandidates,
-        change: MatchableChange,
-    ) -> bool {
-        // don't double process the same pk
-        if candidates
-            .get(change.table)
-            .map(|pks| pks.contains(change.pk))
-            .unwrap_or_default()
-        {
-            return false;
-        }
-
-        // don't consider changes that don't have both the table + col in the matcher query
-        if !self
-            .inner
-            .parsed
-            .table_columns
-            .get(change.table.as_str())
-            .map(|cols| change.column.is_crsql_sentinel() || cols.contains(change.column.as_str()))
-            .unwrap_or_default()
-        {
-            return false;
-        }
-
-        if let Some(v) = candidates.get_mut(change.table) {
-            v.insert(change.pk.to_vec())
-        } else {
-            candidates.insert(change.table.clone(), [change.pk.to_vec()].into());
-            true
-        }
-    }
 }
 
 type StateLock = Arc<(Mutex<MatcherState>, Condvar)>;
@@ -499,6 +528,12 @@ pub struct MatcherStmt {
     temp_query: String,
 }
 
+impl MatcherStmt {
+    pub fn new_query(&self) -> &String {
+        &self.new_query
+    }
+}
+
 const CHANGE_ID_COL: &str = "id";
 const CHANGE_TYPE_COL: &str = "type";
 
@@ -516,8 +551,9 @@ impl Matcher {
         sql: &str,
     ) -> Result<(Matcher, MatcherHandle), MatcherError> {
         let sub_path = Self::sub_path(subs_path.as_path(), id);
+        let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
 
-        info!("Initializing subscription at {sub_path}");
+        info!(%sql_hash, sub_id = %id, "Initializing subscription at {sub_path}");
 
         std::fs::create_dir_all(&sub_path)?;
 
@@ -683,11 +719,13 @@ impl Matcher {
                 pks.get(tbl_name)
                     .cloned()
                     .ok_or(MatcherError::MissingPrimaryKeys)?
-                    .to_vec()
+                    .into_iter()
+                    .map(|pk| format!("coalesce({pk}, \"\")"))
+                    .collect::<Vec<_>>()
                     .join(","),
             );
 
-            info!(sub_id = %id, "modified query for table '{tbl_name}': {new_query}");
+            info!(%sql_hash, sub_id = %id, "modified query for table '{tbl_name}': {new_query}");
 
             statements.insert(
                 tbl_name.clone(),
@@ -707,7 +745,13 @@ impl Matcher {
         // big channel to not miss anything
         let (changes_tx, changes_rx) = mpsc::channel(20480);
 
-        let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
+        // metrics counters
+        let mut counter_map = HashMap::new();
+        for table in parsed.table_columns.keys() {
+            counter_map.insert(table.clone(), HandleMetrics{
+                matched_count: counter!("corro.subs.changes.matched.count", "sql_hash" => sql_hash.clone(), "table" => table.to_string()),
+            });
+        }
 
         let handle = MatcherHandle {
             inner: Arc::new(InnerMatcherHandle {
@@ -724,6 +768,9 @@ impl Matcher {
                 cancel: cancel.clone(),
                 last_change_rx,
                 changes_tx,
+                cached_statements: statements.clone(),
+                subs_path: sub_path.to_string(),
+                metrics: counter_map,
             }),
             state: state.clone(),
         };
@@ -1011,7 +1058,7 @@ impl Matcher {
                 tbl_name,
                 pks,
             ) {
-                info!(sub_id = %self.id, "query plan for table '{tbl_name}':\n{plan}");
+                info!(sub_id = %self.id, sql_hash = %self.hash, "query plan for table '{tbl_name}':\n{plan}");
             }
         }
 
@@ -1019,6 +1066,10 @@ impl Matcher {
     }
 
     async fn cmd_loop(mut self, mut state_conn: CrConn, mut tripwire: Tripwire) {
+        const PROCESS_CHANGES_THRESHOLD: usize = 1000;
+        const PROCESSING_WARN_THRESHOLD: Duration = Duration::from_secs(5);
+        const PROCESS_BUFFER_DEADLINE: Duration = Duration::from_millis(600);
+
         info!(sub_id = %self.id, "Starting loop to run the subscription");
         {
             let (lock, cvar) = &*self.state;
@@ -1036,7 +1087,8 @@ impl Matcher {
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
 
         // max duration of aggregating candidates
-        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(600));
+        let process_changes_deadline = tokio::time::sleep(PROCESS_BUFFER_DEADLINE);
+        tokio::pin!(process_changes_deadline);
 
         loop {
             enum Branch {
@@ -1044,7 +1096,7 @@ impl Matcher {
                 PurgeOldChanges,
             }
 
-            trace!("looping...");
+            // trace!("looping...");
 
             let branch = tokio::select! {
                 biased;
@@ -1055,15 +1107,15 @@ impl Matcher {
                 Some((candidates, db_version)) = self.changes_rx.recv() => {
                     for (table, pks) in  candidates {
                         let buffed = buf.entry(table).or_default();
-                        for pk in pks {
-                            if buffed.insert(pk) {
+                        for (pk, cl) in pks {
+                            if buffed.insert(pk, cl).is_none() {
                                 buf_count += 1;
                             }
                         }
                     }
                     last_db_version = Some(db_version);
 
-                    if buf_count >= 500 {
+                    if buf_count >= PROCESS_CHANGES_THRESHOLD {
                         if let Some(db_version) = last_db_version.take() {
                             Branch::NewCandidates((std::mem::take(&mut buf), db_version))
                         } else {
@@ -1073,7 +1125,13 @@ impl Matcher {
                         continue;
                     }
                 },
-                _ = process_changes_interval.tick() => {
+                _ = process_changes_deadline.as_mut() => {
+                    process_changes_deadline
+                        .as_mut()
+                        .reset((Instant::now() + PROCESS_BUFFER_DEADLINE).into());
+                    if buf_count == 0 {
+                        continue;
+                    }
                     if let Some(db_version) = last_db_version.take(){
                         Branch::NewCandidates((std::mem::take(&mut buf), db_version))
                     } else {
@@ -1093,6 +1151,7 @@ impl Matcher {
 
             match branch {
                 Branch::NewCandidates((candidates, db_version)) => {
+                    let start = Instant::now();
                     if let Err(e) = block_in_place(|| {
                         self.handle_candidates(&mut state_conn, candidates, db_version)
                     }) {
@@ -1101,9 +1160,24 @@ impl Matcher {
                         }
                         break;
                     }
+                    let elapsed = start.elapsed();
+
+                    histogram!("corro.subs.changes.processing.duration.seconds", "sql_hash" => self.hash.clone()).record(elapsed);
+
+                    if elapsed >= PROCESSING_WARN_THRESHOLD {
+                        warn!(sub_id = %self.id, "processed {buf_count} changes (very slowly) for subscription in {elapsed:?}");
+                    } else {
+                        debug!(sub_id = %self.id, "processed {buf_count} changes for subscription in {elapsed:?}");
+                    }
                     buf_count = 0;
+
+                    // reset the deadline
+                    process_changes_deadline
+                        .as_mut()
+                        .reset((Instant::now() + PROCESS_BUFFER_DEADLINE).into());
                 }
                 Branch::PurgeOldChanges => {
+                    let start = Instant::now();
                     let res = block_in_place(|| {
                         let tx = self.conn.transaction()?;
 
@@ -1118,7 +1192,7 @@ impl Matcher {
 
                     match res {
                         Ok(deleted) => {
-                            info!(sub_id = %self.id, "Deleted {deleted} old changes row")
+                            info!(sub_id = %self.id, "Deleted {deleted} old changes row in {:?}", start.elapsed());
                         }
                         Err(e) => {
                             error!(sub_id = %self.id, "could not delete old changes: {e}");
@@ -1377,7 +1451,7 @@ impl Matcher {
         for (table, pks) in candidates {
             let pks = pks
                 .iter()
-                .map(|pk| unpack_columns(pk))
+                .map(|(pk, _)| unpack_columns(pk))
                 .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
 
             let tmp_table_name = format!("temp_{table}");
@@ -1402,7 +1476,10 @@ impl Matcher {
             for pks in pks {
                 tx.prepare_cached(&format!(
                     "INSERT INTO {tmp_table_name} VALUES ({})",
-                    (0..pks.len()).map(|_i| "?").collect::<Vec<_>>().join(",")
+                    (0..pks.len())
+                        .map(|_i| "coalesce(?, \"\")")
+                        .collect::<Vec<_>>()
+                        .join(",")
                 ))?
                 .execute(params_from_iter(pks))?;
             }
@@ -1450,6 +1527,7 @@ impl Matcher {
             ))?;
 
             for table in tables.iter() {
+                let start = Instant::now();
                 let stmt = match self.cached_statements.get(table.as_str()) {
                     Some(stmt) => stmt,
                     None => {
@@ -1601,6 +1679,9 @@ impl Matcher {
                 }
                 // clean that up
                 tx.execute_batch("DELETE FROM state_results")?;
+
+                let elapsed = start.elapsed();
+                histogram!("corro.subs.changes.processing.table.duration.seconds", "sql_hash" => self.hash.clone(), "table" => table.0.to_string()).record(elapsed);
             }
 
             // clean up temporary tables immediately
@@ -1637,7 +1718,7 @@ impl Matcher {
         {
             let mut changes_prepped = state_conn.prepare_cached(
                 r#"
-            SELECT DISTINCT "table", pk
+            SELECT DISTINCT "table", pk, cl
                 FROM crsql_changes
                     WHERE db_version > ?
                       AND db_version <= ? -- TODO: allow going over?
@@ -1651,7 +1732,7 @@ impl Matcher {
                 candidates
                     .entry(row.get(0)?)
                     .or_default()
-                    .insert(row.get(1)?);
+                    .insert(row.get(1)?, row.get(2)?);
             }
         }
 
@@ -1803,7 +1884,7 @@ fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSele
                                     let entry =
                                         parsed.table_columns.entry(tbl_name.0.clone()).or_default();
                                     for name in names.iter() {
-                                        entry.insert(name.0.clone());
+                                        insert_col(entry, schema, &tbl_name.0, &name.0);
                                     }
                                 }
                             }
@@ -1824,6 +1905,20 @@ fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSele
     Ok(parsed)
 }
 
+fn insert_col(set: &mut HashSet<String>, schema: &Schema, tbl_name: &str, name: &str) {
+    let table = schema.tables.get(tbl_name);
+    if let Some(generated) =
+        table.and_then(|tbl| tbl.columns.get(name).and_then(|col| col.generated.as_ref()))
+    {
+        // recursively check for generated columns
+        for name in generated.from.iter() {
+            insert_col(set, schema, tbl_name, name);
+        }
+    } else {
+        set.insert(name.to_owned());
+    }
+}
+
 fn extract_expr_columns(
     expr: &Expr,
     schema: &Schema,
@@ -1834,21 +1929,29 @@ fn extract_expr_columns(
         Expr::Qualified(tblname, colname) => {
             let resolved_name = parsed.aliases.get(&tblname.0).unwrap_or(&tblname.0);
             // println!("adding column: {resolved_name} => {colname:?}");
-            parsed
-                .table_columns
-                .entry(resolved_name.clone())
-                .or_default()
-                .insert(colname.0.clone());
+            insert_col(
+                parsed
+                    .table_columns
+                    .entry(resolved_name.clone())
+                    .or_default(),
+                schema,
+                resolved_name,
+                &colname.0,
+            );
         }
         // simplest case but also mentioning the schema
         Expr::DoublyQualified(schema_name, tblname, colname) if schema_name.0 == "main" => {
             let resolved_name = parsed.aliases.get(&tblname.0).unwrap_or(&tblname.0);
             // println!("adding column: {resolved_name} => {colname:?}");
-            parsed
-                .table_columns
-                .entry(resolved_name.clone())
-                .or_default()
-                .insert(colname.0.clone());
+            insert_col(
+                parsed
+                    .table_columns
+                    .entry(resolved_name.clone())
+                    .or_default(),
+                schema,
+                resolved_name,
+                &colname.0,
+            );
         }
 
         Expr::Name(colname) => {
@@ -1869,11 +1972,12 @@ fn extract_expr_columns(
             }
 
             if let Some(found) = found {
-                parsed
-                    .table_columns
-                    .entry(found.to_owned())
-                    .or_default()
-                    .insert(check_col_name);
+                insert_col(
+                    parsed.table_columns.entry(found.to_owned()).or_default(),
+                    schema,
+                    found,
+                    &check_col_name,
+                );
             } else {
                 return Err(MatcherError::TableForColumnNotFound {
                     col_name: check_col_name,
@@ -1899,11 +2003,12 @@ fn extract_expr_columns(
             }
 
             if let Some(found) = found {
-                parsed
-                    .table_columns
-                    .entry(found.to_owned())
-                    .or_default()
-                    .insert(colname.0.clone());
+                insert_col(
+                    parsed.table_columns.entry(found.to_owned()).or_default(),
+                    schema,
+                    found,
+                    &colname.0,
+                );
             } else {
                 if colname.0.starts_with('"') {
                     return Ok(());
@@ -2348,7 +2453,6 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use camino::Utf8PathBuf;
-    use corro_api_types::row_to_change;
     use rusqlite::params;
     use spawn::wait_for_all_pending_handles;
     use tokio::sync::Semaphore;
@@ -2356,6 +2460,7 @@ mod tests {
     use crate::{
         actor::ActorId,
         agent::migrate,
+        change::row_to_change,
         schema::{apply_schema, parse_sql},
         sqlite::{setup_conn, CrConn},
     };
@@ -2379,10 +2484,12 @@ mod tests {
             tmpdir.path().join("subs").display().to_string().into();
 
         let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1))).await?;
+        let clock = Arc::new(uhlc::HLC::default());
+
         {
             let mut conn = pool.write_priority().await?;
-            setup_conn(&mut conn)?;
-            migrate(&mut conn)?;
+            setup_conn(&conn)?;
+            migrate(clock, &mut conn)?;
             let tx = conn.transaction()?;
             apply_schema(&tx, &Schema::default(), &mut schema)?;
             tx.commit()?;
@@ -2500,10 +2607,10 @@ mod tests {
             .await
             .unwrap();
         let mut conn = pool.write_priority().await.unwrap();
-
+        let clock = Arc::new(uhlc::HLC::default());
         {
-            setup_conn(&mut conn).unwrap();
-            migrate(&mut conn).unwrap();
+            setup_conn(&conn).unwrap();
+            migrate(clock, &mut conn).unwrap();
             let tx = conn.transaction().unwrap();
             apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
             tx.commit().unwrap();
@@ -2539,7 +2646,9 @@ mod tests {
             )
             .expect("could not init crsql");
 
-            setup_conn(&mut conn2).unwrap();
+            setup_conn(&conn2).unwrap();
+            let clock = Arc::new(uhlc::HLC::default());
+            migrate(clock, &mut conn2).unwrap();
 
             {
                 let tx = conn2.transaction().unwrap();
@@ -2562,6 +2671,7 @@ mod tests {
             let tx = conn2.transaction().unwrap();
 
             for change in changes {
+                debug!("change: {change:?}");
                 tx.prepare_cached(
                     r#"
                     INSERT INTO crsql_changes
@@ -2586,11 +2696,11 @@ mod tests {
             }
         }
 
-        let mut matcher_conn =
+        let matcher_conn =
             CrConn::init(rusqlite::Connection::open(&db_path).expect("could not open conn"))
                 .expect("could not init crconn");
 
-        setup_conn(&mut matcher_conn).unwrap();
+        setup_conn(&matcher_conn).unwrap();
 
         let mut last_change_id = None;
 

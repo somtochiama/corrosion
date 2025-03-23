@@ -82,6 +82,8 @@ pub struct SyncStateV1 {
     pub heads: HashMap<ActorId, Version>,
     pub need: HashMap<ActorId, Vec<RangeInclusive<Version>>>,
     pub partial_need: HashMap<ActorId, HashMap<Version, Vec<RangeInclusive<CrsqlSeq>>>>,
+    #[speedy(default_on_eof)]
+    pub last_cleared_ts: Option<Timestamp>,
 }
 
 impl SyncStateV1 {
@@ -256,6 +258,9 @@ pub enum SyncNeedV1 {
         version: Version,
         seqs: Vec<RangeInclusive<CrsqlSeq>>,
     },
+    Empty {
+        ts: Option<Timestamp>,
+    },
 }
 
 impl SyncNeedV1 {
@@ -263,6 +268,7 @@ impl SyncNeedV1 {
         match self {
             SyncNeedV1::Full { versions } => (versions.end().0 - versions.start().0) as usize + 1,
             SyncNeedV1::Partial { .. } => 1,
+            SyncNeedV1::Empty { .. } => 1,
         }
     }
 }
@@ -275,39 +281,44 @@ impl From<SyncStateV1> for SyncMessage {
 
 // generates a `SyncMessage` to tell another node what versions we're missing
 #[tracing::instrument(skip_all, level = "debug")]
-pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
+pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncStateV1 {
     let mut state = SyncStateV1 {
-        actor_id,
+        actor_id: self_actor_id,
         ..Default::default()
     };
 
     let actors: Vec<(ActorId, Booked)> = {
         bookie
-            .read("generate_sync")
+            .read::<&str, _>("generate_sync", None)
             .await
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect()
     };
 
+    let mut last_ts = None;
+
     for (actor_id, booked) in actors {
-        let bookedr = booked
-            .read(format!("generate_sync:{}", actor_id.as_simple()))
-            .await;
+        let bookedr = booked.read("generate_sync", actor_id.as_simple()).await;
 
         let last_version = match { bookedr.last() } {
             None => continue,
             Some(v) => v,
         };
 
-        let need: Vec<_> = bookedr.sync_need().iter().cloned().collect();
+        let need: Vec<_> = bookedr.needed().iter().cloned().collect();
 
         if !need.is_empty() {
             state.need.insert(actor_id, need);
         }
 
         {
-            for (v, partial) in bookedr.partials.iter() {
+            for (v, partial) in bookedr
+                .partials
+                .iter()
+                // don't set partial if it is effectively complete
+                .filter(|(_, partial)| !partial.is_complete())
+            {
                 state.partial_need.entry(actor_id).or_default().insert(
                     *v,
                     partial
@@ -318,8 +329,14 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             }
         }
 
+        if actor_id == self_actor_id {
+            last_ts = bookedr.last_cleared_ts();
+        }
+
         state.heads.insert(actor_id, last_version);
     }
+
+    state.last_cleared_ts = last_ts;
 
     state
 }

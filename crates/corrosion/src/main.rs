@@ -1,7 +1,7 @@
 use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use admin::AdminConn;
@@ -227,21 +227,23 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 eyre::bail!("corrosion is currently running, shut it down before restoring!");
             }
 
-            let db_path = match cli.db_path() {
-                Ok(db_path) => db_path,
+            let config = match cli.config() {
+                Ok(config) => config,
                 Err(_e) => {
                     eyre::bail!(
-                        "path to current database is required either via --db-path or specified in the config file passed as --config"
+                        "path to current database is required via the config file passed as --config"
                     );
                 }
             };
+
+            let db_path = &config.db.path;
 
             if *self_actor_id || actor_id.is_some() {
                 let site_id: Uuid = {
                     if let Some(actor_id) = actor_id {
                         *actor_id
                     } else {
-                        let conn = Connection::open(&db_path)?;
+                        let conn = Connection::open(db_path)?;
                         conn.query_row(
                             "SELECT site_id FROM crsql_site_id WHERE ordinal = 0;",
                             [],
@@ -263,7 +265,6 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                     warn!("snapshot database did not know about the current actor id");
                 }
 
-                // FIXME: find the old site_id for ordinal 0 and fix crsql_clock tables
                 let inserted = conn.execute(
                     "INSERT OR REPLACE INTO crsql_site_id (ordinal, site_id) VALUES (0, ?)",
                     [site_id],
@@ -273,19 +274,43 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 }
 
                 if let Some(ordinal) = ordinal {
-                    let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
+                    if ordinal == 0 {
+                        warn!("skipping clock table site_id rewrite: ordinal was 0 and therefore did not change");
+                    } else {
+                        info!("rewriting clock tables site_id");
+                        let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
 
-                    for table in tables {
-                        let n = conn.execute(
-                            &format!("UPDATE \"{table}\" SET site_id = 0 WHERE site_id = ?"),
-                            [ordinal],
-                        )?;
-                        info!("Updated {n} rows in {table}");
+                        for table in tables {
+                            let n = conn.execute(
+                                &format!("UPDATE \"{table}\" SET site_id = 0 WHERE site_id = ?"),
+                                [ordinal],
+                            )?;
+                            info!("Updated {n} rows in {table}");
+                        }
                     }
                 }
             }
 
-            if path.as_path() == db_path.as_std_path() {
+            let subs_path = config.db.subscriptions_path();
+
+            info!("removing subscriptions at {subs_path}");
+            match tokio::fs::remove_dir_all(subs_path).await {
+                Ok(_) => {
+                    info!("cleared subscriptions");
+                }
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        info!("no subscriptions to delete.");
+                    }
+                    _ => {
+                        eyre::bail!(
+                            "aborting restore! could not delete previous subscriptions: {e}"
+                        )
+                    }
+                },
+            }
+
+            if path == db_path {
                 info!("reused the db path, not copying database into place");
             } else {
                 let restored =
@@ -389,6 +414,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             query,
             param,
             timer,
+            timeout
         } => {
             let stmt = if param.is_empty() {
                 Statement::Simple(query.clone())
@@ -399,7 +425,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 )
             };
 
-            let res = cli.api_client()?.execute(&[stmt]).await?;
+            let res = cli.api_client()?.execute(&[stmt], *timeout).await?;
 
             for res in res.results {
                 match res {
@@ -425,6 +451,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Sync(
                 corro_admin::SyncCommand::Generate,
+            ))
+            .await?;
+        }
+        Command::Sync(SyncCommand::ReconcileGaps) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::ReconcileGaps,
             ))
             .await?;
         }
@@ -457,9 +490,50 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
-        Command::CompactEmpties => {
+        Command::Db(DbCommand::Lock { cmd }) => {
+            let config = match cli.config() {
+                Ok(config) => config,
+                Err(_e) => {
+                    eyre::bail!(
+                        "path to current database is required via the config file passed as --config"
+                    );
+                }
+            };
+
+            let db_path = &config.db.path;
+            info!("Opening DB file at {db_path}");
+            let mut db_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(db_path)?;
+
+            info!("Acquiring lock...");
+            let start = Instant::now();
+            let _lock = sqlite3_restore::lock_all(&mut db_file, db_path, Duration::from_secs(30))?;
+            info!("Lock acquired after {:?}", start.elapsed());
+
+            info!("Launching command {cmd}");
+            let mut splitted_cmd = shell_words::split(cmd.as_str())?;
+            let exit = std::process::Command::new(splitted_cmd.remove(0))
+                .args(splitted_cmd)
+                .spawn()?
+                .wait()?;
+
+            info!("Exited with code: {:?}", exit.code());
+            std::process::exit(exit.code().unwrap_or(1));
+        }
+        Command::Subs(SubsCommand::Info { hash, id }) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
-            conn.send_command(corro_admin::Command::CompactEmpties)
+            conn.send_command(corro_admin::Command::Subs(corro_admin::SubsCommand::Info {
+                hash: hash.clone(),
+                id: *id,
+            }))
+            .await?;
+        }
+        Command::Subs(SubsCommand::List) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Subs(corro_admin::SubsCommand::List))
                 .await?;
         }
     }
@@ -472,7 +546,7 @@ fn main() {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(4)
+        .worker_threads(8)
         .build()
         .expect("could not build tokio runtime");
 
@@ -483,10 +557,10 @@ fn main() {
 }
 
 #[derive(Parser)]
-#[clap(version = VERSION)]
+#[command(version = VERSION)]
 struct Cli {
     /// Set the config file path
-    #[clap(
+    #[arg(
         long = "config",
         short,
         global = true,
@@ -494,13 +568,13 @@ struct Cli {
     )]
     config_path: Utf8PathBuf,
 
-    #[clap(long, global = true)]
+    #[arg(long, global = true)]
     api_addr: Option<SocketAddr>,
 
-    #[clap(long, global = true)]
+    #[arg(long, global = true)]
     db_path: Option<Utf8PathBuf>,
 
-    #[clap(long, global = true)]
+    #[arg(long, global = true)]
     admin_path: Option<Utf8PathBuf>,
 
     #[command(subcommand)]
@@ -518,7 +592,7 @@ impl Cli {
         Ok(if let Some(api_addr) = self.api_addr {
             api_addr
         } else {
-            self.config()?.api.bind_addr
+            *self.config()?.api.bind_addr.first().unwrap()
         })
     }
 
@@ -562,7 +636,7 @@ enum Command {
 
     /// Restore the Corrosion DB from a backup
     Restore {
-        path: PathBuf,
+        path: Utf8PathBuf,
         #[arg(long, default_value = "false")]
         self_actor_id: bool,
         #[arg(long)]
@@ -596,6 +670,8 @@ enum Command {
         param: Vec<String>,
         #[arg(long, default_value = "false")]
         timer: bool,
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// Reload the config
@@ -623,9 +699,13 @@ enum Command {
     #[command(subcommand)]
     Tls(TlsCommand),
 
-    /// Clear overwritten versions
+    /// DB-related commands
     #[command(subcommand)]
-    CompactEmpties,
+    Db(DbCommand),
+
+    /// Subscription related commands
+    #[command(subcommand)]
+    Subs(SubsCommand),
 }
 
 #[derive(Subcommand)]
@@ -652,6 +732,8 @@ enum ConsulCommand {
 enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
+    /// Reconcile gaps between memory and DB
+    ReconcileGaps,
 }
 
 #[derive(Subcommand)]
@@ -699,5 +781,24 @@ enum TlsClientCommand {
         ca_key: Utf8PathBuf,
         #[arg(long)]
         ca_cert: Utf8PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbCommand {
+    /// Acquires the lock on the DB
+    Lock { cmd: String },
+}
+
+#[derive(Subcommand)]
+enum SubsCommand {
+    /// List all subscriptions on a node
+    List,
+    /// Get information on a subscription
+    Info {
+        #[arg(long)]
+        hash: Option<String>,
+        #[arg(long)]
+        id: Option<Uuid>,
     },
 }

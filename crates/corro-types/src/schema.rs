@@ -15,15 +15,23 @@ use sqlite3_parser::ast::{
 };
 use tracing::{debug, info, trace};
 
+use crate::agent::create_clock_change_trigger;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Column {
     pub name: String,
     pub sql_type: (SqliteType, Option<String>),
     pub nullable: bool,
     pub default_value: Option<String>,
-    pub generated: Option<String>,
+    pub generated: Option<Generated>,
     pub primary_key: bool,
     pub raw: ColumnDefinition,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct Generated {
+    pub raw: String,
+    pub from: Vec<String>,
 }
 
 impl Column {
@@ -239,7 +247,9 @@ pub enum ApplySchemaError {
     DropTableWithoutDestructiveFlag(String),
     #[error("won't remove column without the destructive flag set (table: '{0}', column: '{1}')")]
     RemoveColumnWithoutDestructiveFlag(String, String),
-    #[error("can't add a primary key (table: '{0}', column: '{1}')")]
+    #[error("won't change column without the destructive flag set (table: '{0}', column: '{1}')")]
+    ChangeColumnWithoutDestructiveFlag(String, String),
+    #[error("can't add a primary key (table: '{0}', columns: '{1}')")]
     AddPrimaryKey(String, String),
     #[error("can't modify primary keys (table: '{0}')")]
     ModifyPrimaryKeys(String),
@@ -372,6 +382,9 @@ pub fn apply_schema(
                     .to_string(),
                 )?;
             }
+
+            // create the trigger for this table, in case it does not exist
+            create_clock_change_trigger(tx, name)?;
         }
     }
 
@@ -436,6 +449,14 @@ pub fn apply_schema(
             changed_cols.keys().collect::<Vec<_>>()
         );
 
+        if !changed_cols.is_empty() {
+            // TODO: add destructive flag
+            return Err(ApplySchemaError::ChangeColumnWithoutDestructiveFlag(
+                table.name.clone(),
+                changed_cols.keys().cloned().collect::<Vec<_>>().join(","),
+            ));
+        }
+
         let new_col_names = new_table
             .columns
             .keys()
@@ -486,7 +507,7 @@ pub fn apply_schema(
                 }
 
                 if require_migration {
-                    tx.execute_batch(&format!("SELECT crsql_commit_alter('{name}');"))?;
+                    tx.execute_batch(&format!("SELECT crsql_commit_alter('main', '{name}', 1);"))?;
                 }
                 info!(
                     "Altering crsql for table {} took {:?}",
@@ -825,8 +846,16 @@ fn prepare_table(
                         nullable,
                         default_value,
                         generated: def.constraints.iter().find_map(|named| {
-                            if let ColumnConstraint::Generated { ref expr, .. } = named.constraint {
-                                Some(expr.to_string())
+                            if let ColumnConstraint::Generated { ref expr, ref typ } =
+                                named.constraint
+                            {
+                                trace!("generated typ: {typ:?}, expr: {expr:?}");
+                                let mut from = vec![];
+                                extract_expr_columns(expr, &mut from);
+                                Some(Generated {
+                                    raw: expr.to_string(),
+                                    from,
+                                })
                             } else {
                                 None
                             }
@@ -842,5 +871,21 @@ fn prepare_table(
             constraints: constraints.cloned(),
             options: *options,
         },
+    }
+}
+
+fn extract_expr_columns(expr: &Expr, cols: &mut Vec<String>) {
+    match expr {
+        Expr::FunctionCall {
+            args: Some(args), ..
+        } => {
+            for expr in args.iter() {
+                extract_expr_columns(expr, cols);
+            }
+        }
+        Expr::Id(colname) => {
+            cols.push(unquote(&colname.0).ok().unwrap_or(colname.0.clone()));
+        }
+        _ => {}
     }
 }
