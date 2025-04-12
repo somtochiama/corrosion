@@ -1,4 +1,12 @@
 steps:
+    - label: "🔍 Lint"
+    priority: 80
+    key: lint
+    commands:
+      - .buildkite/run-in-docker.sh .buildkite/lint.sh
+    agents:
+      queue: "high-concurrency"
+
   - label: "✅ Test"
     priority: 80
     key: test
@@ -22,4 +30,4 @@ steps:
     key: upload
     commands:
       - .buildkite/upload.sh
-    depends_on: [test, build]
+    depends_on: [lint, test, build]

@@ -24,6 +24,7 @@ use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
 use sqlite_pool::{Committable, InterruptibleTransaction};
+
 use tokio::{
     sync::{
         mpsc::{self, channel},
@@ -89,7 +90,8 @@ where
         })?;
 
         let elapsed = start.elapsed();
-        histogram!("corro.agent.changes.processing.time.seconds", "source" => "local").record(start.elapsed());
+        histogram!("corro.agent.changes.processing.time.seconds", "source" => "local")
+            .record(start.elapsed());
 
         match insert_info {
             None => Ok((ret, None, elapsed)),
@@ -179,7 +181,7 @@ pub async fn api_v1_transactions(
             .iter()
             .map(|stmt| {
                 let start = Instant::now();
-                let res = execute_statement(tx, stmt).map_err(|e| ChangeError::Rusqlite{
+                let res = execute_statement(tx, stmt).map_err(|e| ChangeError::Rusqlite {
                     source: e,
                     actor_id: None,
                     version: None,
