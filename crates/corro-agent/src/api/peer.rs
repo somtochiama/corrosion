@@ -355,7 +355,7 @@ fn handle_need(
     sender: &Sender<SyncMessage>,
     last_cleared_ts: Option<Timestamp>,
 ) -> eyre::Result<()> {
-    debug!(%actor_id, "handle known versions! need: {need:?}");
+    debug!(%actor_id, self_actor_id = %agent.actor_id(), "handle known versions! need: {need:?}");
 
     let mut empties: RangeInclusiveMap<Version, Timestamp> = RangeInclusiveMap::new();
 
@@ -1131,7 +1131,7 @@ pub async fn parallel_sync(
 
                     let mut needs = our_sync_state.compute_available_needs(&their_sync_state);
 
-                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs");
+                    debug!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs: {:?}, their_sync_state: {:?}", needs, their_sync_state);
 
                     let cleared_ts = their_sync_state.last_cleared_ts;
 
@@ -1739,7 +1739,7 @@ mod tests {
 
     use crate::{
         agent::{process_multiple_changes, setup},
-        api::public::{api_v1_db_schema, TransactionParams},
+        api::public::{api_v1_db_schema, TimeoutParams},
     };
 
     use super::*;
@@ -1757,7 +1757,7 @@ mod tests {
         for i in versions_range.clone() {
             let (status_code, body) = api_v1_transactions(
                 Extension(ta1.agent.clone()),
-                axum::extract::Query(TransactionParams{timeout: None}),
+                axum::extract::Query(TimeoutParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "INSERT OR REPLACE INTO testsblob (id,text) VALUES (?,?)".into(),
                     vec![format!("service-id-{i}").into(), "service-name".into()],

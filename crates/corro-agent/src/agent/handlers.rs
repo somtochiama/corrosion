@@ -90,6 +90,7 @@ pub fn spawn_gossipserver_handler(
             gossip_server_endpoint.close(0u32.into(), b"shutting down");
         }
     });
+    info!("gossipserver_handler is done");
 }
 
 /// Spawn a task which handles all state and interactions for a given
@@ -194,7 +195,7 @@ pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Conn
 /// everyone.
 ///
 ///
-pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
+pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, mut tripwire: Tripwire) {
     tokio::spawn({
         let agent = agent.clone();
         async move {
@@ -205,7 +206,12 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
             tokio::pin!(timer);
 
             loop {
-                timer.as_mut().await;
+                tokio::select! {
+                    _ = &mut tripwire => {
+                        break;
+                    }
+                    _ = timer.as_mut() => {}
+                }
 
                 match bootstrap::generate_bootstrap(
                     agent.config().gossip.bootstrap.as_slice(),
@@ -385,16 +391,16 @@ pub async fn handle_notifications(
 /// multiple gigabytes and needs periodic truncation.  We don't want
 /// to schedule this task too often since it locks the whole DB.
 // TODO: can we get around the lock somehow?
-fn wal_checkpoint(conn: &rusqlite::Connection) -> eyre::Result<()> {
+fn wal_checkpoint(conn: &rusqlite::Connection, timeout: u64) -> eyre::Result<()> {
     debug!("handling db_cleanup (WAL truncation)");
     let start = Instant::now();
 
     let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
-    conn.pragma_update(None, "busy_timeout", 60000)?;
+    conn.pragma_update(None, "busy_timeout", timeout)?;
 
     let busy: bool = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
     if busy {
-        warn!("could not truncate sqlite WAL, database busy");
+        warn!("could not truncate sqlite WAL, database busy - with timeout: {timeout}");
         counter!("corro.db.wal.truncate.busy").increment(1);
     } else {
         debug!("successfully truncated sqlite WAL!");
@@ -432,8 +438,6 @@ async fn vacuum_db(pool: &SplitPool, lim: u64) -> eyre::Result<()> {
         // update settings in write conn
         let conn = pool.write_low().await?;
         let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
-        conn.pragma_update(None, "busy_timeout", 60000)?;
-
         let cache_size: i64 = conn.pragma_query_value(None, "cache_size", |row| row.get(0))?;
         conn.pragma_update(None, "cache_size", 100000)?;
         (orig, cache_size)
@@ -521,10 +525,31 @@ async fn wal_checkpoint_over_threshold(
 ) -> eyre::Result<bool> {
     let should_truncate = wal_path.metadata()?.len() > threshold;
     if should_truncate {
+        let timeout = calc_busy_timeout(wal_path.metadata()?.len(), threshold);
         let conn = pool.write_low().await?;
-        block_in_place(|| wal_checkpoint(&conn))?;
+        block_in_place(|| wal_checkpoint(&conn, timeout))?;
     }
     Ok(should_truncate)
+}
+
+fn calc_busy_timeout(wal_size: u64, threshold: u64) -> u64 {
+    let wal_size_gb = wal_size / (1024 * 1024 * 1024);
+    let threshold_gb = threshold / (1024 * 1024 * 1024);
+    let base_timeout = 30000;
+    if wal_size_gb <= threshold_gb {
+        return base_timeout;
+    }
+
+    // Double the timeout every 10gb and cap at 64 minutes
+    let diff = cmp::min(5, wal_size_gb / 10);
+    // add extra (five * diff) seconds for every extra 1gb over 10gb
+    let linear_increase = (wal_size_gb % 10) * 5000 * diff;
+    let timeout = base_timeout * 2_u64.pow(diff as u32) + linear_increase;
+    // we are using a 16min timeout, something is wrong if we get here
+    if diff >= 5 {
+        warn!("WAL size is too large, setting busy timeout {timeout}ms");
+    }
+    timeout
 }
 
 /// Handle incoming emptyset received during syncs
@@ -754,7 +779,14 @@ pub async fn handle_changes(
     ));
 
     let max_seen_cache_len: usize = max_queue_len;
-    let keep_seen_cache_size: usize = cmp::max(10, max_seen_cache_len / 10);
+
+    // unlikely, but max_seen_cache_len can be less than 10, in that case we want to just clear the whole cache
+    // (todo): put some validation in config instead
+    let keep_seen_cache_size: usize = if max_seen_cache_len > 10 {
+        cmp::max(10, max_seen_cache_len / 10)
+    } else {
+        0
+    };
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
     let mut drop_log_count: u64 = 0;
@@ -782,7 +814,12 @@ pub async fn handle_changes(
             let changes = std::mem::take(&mut buf);
             let agent = agent.clone();
             let bookie = bookie.clone();
-            join_set.spawn(process_multiple_changes(agent, bookie, changes.clone(), tx_timeout));
+            join_set.spawn(process_multiple_changes(
+                agent,
+                bookie,
+                changes.clone(),
+                tx_timeout,
+            ));
             counter!("corro.agent.changes.batch.spawned").increment(1);
 
             buf_cost -= tmp_cost;
@@ -1085,7 +1122,7 @@ mod tests {
         let pragma_value = 12345u64;
         conn.pragma_update(None, "busy_timeout", pragma_value)?;
 
-        wal_checkpoint(&conn)?;
+        wal_checkpoint(&conn, 60000)?;
         assert_eq!(
             conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))?,
             pragma_value
@@ -1107,6 +1144,7 @@ mod tests {
             .build()?;
         config.perf.apply_queue_len = 1;
         config.perf.processing_queue_len = 3;
+        config.perf.changes_channel_len = 1;
 
         let (agent, agent_options) = setup(config, tripwire.clone()).await?;
 
@@ -1139,7 +1177,7 @@ mod tests {
                     cid: ColumnName("text".into()),
                     val: "two override".into(),
                     col_version: 1,
-                    db_version: CrsqlDbVersion(4),
+                    db_version: CrsqlDbVersion(i as u64),
                     seq: CrsqlSeq(0),
                     site_id: agent.actor_id().to_bytes(),
                     cl: 1,
@@ -1232,5 +1270,40 @@ mod tests {
         );
 
         Ok(())
+    }
+    #[test]
+    fn check_busy_timeout() {
+        // Base timeout (30s) applies up to threshold
+        assert_eq!(calc_busy_timeout(to_bytes(1), to_bytes(5)), 30000); // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(4), to_bytes(5)), 30000); // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(5), to_bytes(5)), 30000); // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(9), to_bytes(5)), 30000); // 30s
+
+        // At 10GB we hit first doubling + linear increases (5s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(10), to_bytes(5)), 60000); // 1m
+        assert_eq!(calc_busy_timeout(to_bytes(11), to_bytes(5)), 65000); // 1m10s
+        assert_eq!(calc_busy_timeout(to_bytes(15), to_bytes(5)), 85000); // 1m50s
+
+        // At 20GB we hit second doubling + linear increases (10s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(20), to_bytes(5)), 120000); // 2m
+        assert_eq!(calc_busy_timeout(to_bytes(21), to_bytes(5)), 130000); // 2m10s
+        assert_eq!(calc_busy_timeout(to_bytes(25), to_bytes(5)), 170000); // 2m50s
+
+        // At 30GB we hit third doubling + linear increases (15s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(30), to_bytes(5)), 240000); // 4m
+        assert_eq!(calc_busy_timeout(to_bytes(31), to_bytes(5)), 255000); // 4m15s
+
+        // At 40GB we hit fourth doubling + linear increases (20s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(40), to_bytes(5)), 480000); // 8m
+        assert_eq!(calc_busy_timeout(to_bytes(41), to_bytes(5)), 500000); // 8m20s
+
+        // At 50GB we hit fifth doubling and cap at 16m
+        assert_eq!(calc_busy_timeout(to_bytes(50), to_bytes(5)), 960000); // 16m
+        assert_eq!(calc_busy_timeout(to_bytes(51), to_bytes(5)), 985000); // 16m25s (capped)
+        assert_eq!(calc_busy_timeout(to_bytes(100), to_bytes(5)), 960000); // 16m (capped)
+    }
+
+    fn to_bytes(gb: u64) -> u64 {
+        gb * 1024 * 1024 * 1024
     }
 }
