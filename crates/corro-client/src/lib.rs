@@ -51,10 +51,14 @@ impl CorrosionApiClient {
     pub async fn query_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
+        timeout: Option<u64>,
     ) -> Result<QueryStream<T>, Error> {
+        let params = timeout
+            .map(|t| format!("?timeout={}", t))
+            .unwrap_or_default();
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
-            .uri(format!("http://{}/v1/queries", self.api_addr))
+            .uri(format!("http://{}/v1/queries{}", self.api_addr, params))
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statement)?))?;
@@ -93,8 +97,9 @@ impl CorrosionApiClient {
     pub async fn query(
         &self,
         statement: &Statement,
+        timeout: Option<u64>,
     ) -> Result<QueryStream<Vec<SqliteValue>>, Error> {
-        self.query_typed(statement).await
+        self.query_typed(statement, timeout).await
     }
 
     pub async fn subscribe_typed<T: DeserializeOwned + Unpin>(
@@ -257,9 +262,16 @@ impl CorrosionApiClient {
         self.updates_typed(table).await
     }
 
-    pub async fn execute(&self, statements: &[Statement], timeout: Option<u64>) -> Result<ExecResponse, Error> {
+    pub async fn execute(
+        &self,
+        statements: &[Statement],
+        timeout: Option<u64>,
+    ) -> Result<ExecResponse, Error> {
         let uri = if let Some(timeout) = timeout {
-            format!("http://{}/v1/transactions?timeout={}", self.api_addr, timeout)
+            format!(
+                "http://{}/v1/transactions?timeout={}",
+                self.api_addr, timeout
+            )
         } else {
             format!("http://{}/v1/transactions", self.api_addr)
         };
@@ -273,12 +285,39 @@ impl CorrosionApiClient {
 
         let res = self.api_client.request(req).await?;
 
-        if !res.status().is_success() {
-            return Err(Error::UnexpectedStatusCode(res.status()));
+        let status = res.status();
+        if !status.is_success() {
+            match hyper::body::to_bytes(res.into_body()).await {
+                Ok(b) => match serde_json::from_slice(&b) {
+                    Ok(res) => match res {
+                        ExecResponse { results, .. } => {
+                            if let Some(ExecResult::Error { error }) = results
+                                .into_iter()
+                                .find(|r| matches!(r, ExecResult::Error { .. }))
+                            {
+                                return Err(Error::ResponseError(error));
+                            }
+                            return Err(Error::UnexpectedStatusCode(status));
+                        }
+                    },
+                    Err(e) => {
+                        debug!(
+                            error = %e,
+                            "could not deserialize response body, sending generic error..."
+                        );
+                        return Err(Error::UnexpectedStatusCode(status));
+                    }
+                },
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        "could not aggregate response body bytes, sending generic error..."
+                    );
+                    return Err(Error::UnexpectedStatusCode(status));
+                }
+            }
         }
-
         let bytes = hyper::body::to_bytes(res.into_body()).await?;
-
         Ok(serde_json::from_slice(&bytes)?)
     }
 
@@ -460,10 +499,11 @@ impl CorrosionPooledClient {
     pub async fn query_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
+        timeout: Option<u64>,
     ) -> Result<QueryStream<T>, Error> {
         let (response, generation) = {
             let (client, generation) = self.get_client().await?;
-            let response = client.query_typed(statement).await;
+            let response = client.query_typed(statement, timeout).await;
 
             (response, generation)
         };

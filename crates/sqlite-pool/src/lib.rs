@@ -1,7 +1,6 @@
 mod config;
 
 use arc_swap::ArcSwap;
-use tracing::warn;
 use std::{
     fmt,
     ops::{Deref, DerefMut},
@@ -10,6 +9,7 @@ use std::{
         Arc,
     },
 };
+use tracing::warn;
 
 use deadpool::{
     async_trait,
@@ -230,7 +230,8 @@ where
             // pg and this would spam the logs.
             // warn!("interrupting sqlite connection - sql - {:?})", sql);
             interrupt_hdl.interrupt();
-            counter!("corro.sqlite.interrupt", "source" => source, "reason" => "cancellation").increment(1);
+            counter!("corro.sqlite.interrupt", "source" => source, "reason" => "cancellation")
+                .increment(1);
         });
     }
 }
@@ -262,11 +263,16 @@ pub struct InterruptibleStatement<T> {
     sql: String,
 }
 
-impl<'conn, T> InterruptibleStatement<T>
+impl<'conn, 'a, T> InterruptibleStatement<T>
 where
     T: Deref<Target = rusqlite::Statement<'conn>> + DerefMut<Target = rusqlite::Statement<'conn>>,
 {
-    pub fn new(stmt: T, interrupt_hdl: Arc<InterruptHandle>, timeout: Option<Duration>, sql: String) -> Self {
+    pub fn new(
+        stmt: T,
+        interrupt_hdl: Arc<InterruptHandle>,
+        timeout: Option<Duration>,
+        sql: String,
+    ) -> Self {
         Self {
             stmt,
             timeout,
@@ -278,6 +284,20 @@ where
     pub fn execute<P: Params>(&mut self, params: P) -> Result<usize, rusqlite::Error> {
         let token = self.interrupt_on_timeout();
         let res = self.stmt.execute(params);
+        token.cancel();
+        res
+    }
+
+    pub fn query<'rows, P: Params>(
+        &'a mut self,
+        params: P,
+    ) -> Result<rusqlite::Rows<'rows>, rusqlite::Error>
+    where
+        'conn: 'rows,
+        'a: 'rows,
+    {
+        let token = self.interrupt_on_timeout();
+        let res = self.stmt.query(params);
         token.cancel();
         res
     }
@@ -358,7 +378,7 @@ impl Committable for rusqlite::Connection {
     }
 }
 
-pub struct Statement<'conn>(rusqlite::Statement<'conn>);
+pub struct Statement<'conn>(pub rusqlite::Statement<'conn>);
 
 impl<'conn> Deref for Statement<'conn> {
     type Target = rusqlite::Statement<'conn>;
