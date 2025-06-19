@@ -1,51 +1,56 @@
-name: Download crsqlite
+name: Release
 
 permissions:
   contents: write
 
 on:
-  workflow_dispatch:
-    inputs:
-      repo:
-        description: "The repository to download crsqlite from"
+  push:
+    tags:
+      - v[0-9]+.*
 
-      tag:
-        description: "The tag to download crsqlite from"
-        required: true
-        default: "prebuild-test.site-db-version-6"
-
-      branch:
-        description: "The branch to make commit to"
-        required: true
-        default: "main"
+env:
+  RUSTFLAGS: -D warnings --cfg tokio_unstable
+  CARGO_TERM_COLOR: always
 
 jobs:
-  download:
+  create-release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checks out repository to runner
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v3
+      - uses: taiki-e/create-gh-release-action@v1
         with:
-          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download crsqlite
-        run: |
-          oses=("darwin-aarch64" "linux-aarch64" "linux-x86_64")
+  upload-assets:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v3
 
-          for os in "${oses[@]}"; do
-              if [[ $os == *"darwin"* ]]; then
-                  EXT="dylib"
-              else
-                  EXT="so"
-              fi
-              curl -L -o crsqlite-${os}.zip https://github.com/${{ inputs.repo }}/cr-sqlite/releases/download/crsqlite-${os}.zip
-              unzip -p crsqlite-${os}.zip > crates/corro-types/crsqlite-${os}.${EXT}
-              rm crsqlite-${os}.zip
-          done
+      - uses: rui314/setup-mold@v1
 
-
-      - uses: EndBug/add-and-commit@v9
+      - uses: taiki-e/setup-cross-toolchain-action@v1
         with:
-          add: crates/corro-types
-          message: "Update crsqlite to ${inputs.tag}"
-          push: true
+          target: ${{ matrix.target }}
+        if: startsWith(matrix.os, 'ubuntu')
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.3
+
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: corrosion
+          archive: "corrosion-$target"
+          target: ${{ matrix.target }}
+          token: ${{ secrets.GITHUB_TOKEN }}
