@@ -30,13 +30,13 @@ jobs:
       - name: Download crsqlite
         run: |
           INPUT_BRANCH=${{ inputs.branch }}
-          if [[ -z $INPUT_BRANCH || $INPUT_BRANCH=="main" ]]; then
-            echo "Please specify a different commit branch, main is not allowed"
-            exit 1
+          if [[ -z "$INPUT_BRANCH" || "$INPUT_BRANCH" == "main" ]]; then
+              echo "Please specify a different commit branch, main is not allowed"
+              exit 1
           fi
 
           INPUT_REPO=${{ inputs.repo }}
-          if [[ -z $INPUT_REPO ]]; then
+          if [[ -z "$INPUT_REPO" ]]; then
             INPUT_REPO=${{ github.repository_owner }}
           fi
           TAG=${{ inputs.tag }} REPO=${INPUT_REPO} ./.buildkite/download-crsqlite.sh
