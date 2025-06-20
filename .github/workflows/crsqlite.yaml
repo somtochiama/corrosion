@@ -12,8 +12,7 @@ on:
 
       branch:
         description: "Branch to make commit to [optional]"
-        required: false
-        default: ""
+        required: true
 
       repo:
         description: "The repository to download crsqlite [optional]"
@@ -31,7 +30,7 @@ jobs:
       - name: Download crsqlite
         run: |
           INPUT_BRANCH=${{ inputs.branch }}
-          if $INPUT_BRANCH=="main"; then
+          if [[ -z $INPUT_BRANCH || $INPUT_BRANCH=="main" ]]; then
             echo "Please specify a different commit branch, main is not allowed"
             exit 1
           fi
