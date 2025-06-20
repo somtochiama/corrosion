@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "The tag to download crsqlite from"
+        description: "Crsqlite tag to download artifacts"
         required: true
 
       branch:
-        description: "Branch to make commit to [optional]"
+        description: "Target branch for commit"
         required: true
 
       repo:
