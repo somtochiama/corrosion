@@ -6,16 +6,16 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      repo:
-        description: "The repository to download crsqlite from"
-        default: ""
-
       tag:
         description: "The tag to download crsqlite from"
         required: true
 
+      repo:
+        description: "The repository to download crsqlite [optional]"
+        default: ""
+
       branch:
-        description: "The new branch to make commit to"
+        description: "New branch to make commit to [optional]"
         required: false
         default: ""
 
