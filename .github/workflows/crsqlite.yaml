@@ -15,7 +15,7 @@ on:
         required: true
 
       branch:
-        description: "The branch to make commit to"
+        description: "The new branch to make commit to"
         required: false
         default: ""
 
@@ -40,5 +40,6 @@ jobs:
       - uses: EndBug/add-and-commit@v9
         with:
           add: crates/corro-types
+          new_branch: "${{ inputs.branch }}"
           message: "Update crsqlite to ${inputs.tag}"
           push: true
