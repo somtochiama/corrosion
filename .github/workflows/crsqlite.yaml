@@ -10,13 +10,13 @@ on:
         description: "The tag to download crsqlite from"
         required: true
 
-      repo:
-        description: "The repository to download crsqlite [optional]"
+      branch:
+        description: "Branch to make commit to [optional]"
+        required: false
         default: ""
 
-      branch:
-        description: "New branch to make commit to [optional]"
-        required: false
+      repo:
+        description: "The repository to download crsqlite [optional]"
         default: ""
 
 jobs:
@@ -30,12 +30,17 @@ jobs:
 
       - name: Download crsqlite
         run: |
+          INPUT_BRANCH=${{ inputs.branch }}
+          if $INPUT_BRANCH=="main"; then
+            echo "Please specify a different commit branch, main is not allowed"
+            exit 1
+          fi
+
           INPUT_REPO=${{ inputs.repo }}
           if [[ -z $INPUT_REPO ]]; then
             INPUT_REPO=${{ github.repository_owner }}
           fi
           TAG=${{ inputs.tag }} REPO=${INPUT_REPO} ./.buildkite/download-crsqlite.sh
-
 
       - uses: EndBug/add-and-commit@v9
         with:
