@@ -8,7 +8,6 @@ on:
     inputs:
       repo:
         description: "The repository to download crsqlite from"
-        required: true
         default: ""
 
       tag:
@@ -43,7 +42,7 @@ jobs:
               else
                   EXT="so"
               fi
-              curl -L -o crsqlite-${os}.zip https://github.com/${{ inputs.repo }}/cr-sqlite/releases/download/crsqlite-${os}.zip
+              curl -L -o crsqlite-${os}.zip https://github.com/${{ inputs.repo }}/cr-sqlite/releases/download/${{ inputs.tag }}/crsqlite-${os}.zip
               unzip -p crsqlite-${os}.zip > crates/corro-types/crsqlite-${os}.${EXT}
               rm crsqlite-${os}.zip
           done
