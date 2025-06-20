@@ -41,5 +41,5 @@ jobs:
         with:
           add: crates/corro-types
           new_branch: "${{ inputs.branch }}"
-          message: "Update crsqlite to ${inputs.tag}"
+          message: "Update crsqlite to ${{ inputs.tag }}"
           push: true
