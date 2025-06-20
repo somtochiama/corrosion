@@ -1,10 +1,5 @@
 #!/bin/bash
 
-if [[ -z "$INPUT_BRANCH" || "$INPUT_BRANCH" == "main" ]]; then
-    echo "Please specify a different commit branch, main is not allowed"
-    exit 1
-fi
-
 if [[ -z "$REPO" ]]; then
     echo "Set crsqlite repository owner with REPO env var"
     exit 1
