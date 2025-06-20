@@ -17,7 +17,7 @@ on:
       branch:
         description: "The branch to make commit to"
         required: false
-        default: "main"
+        default: ""
 
 jobs:
   download:
@@ -30,22 +30,11 @@ jobs:
 
       - name: Download crsqlite
         run: |
-          REPO=${{ inputs.repo }}
-          if [[ -z $REPO ]]; then
-            REPO=${{ github.repository_owner }}
+          INPUT_REPO=${{ inputs.repo }}
+          if [[ -z $INPUT_REPO ]]; then
+            INPUT_REPO=${{ github.repository_owner }}
           fi
-          oses=("darwin-aarch64" "linux-aarch64" "linux-x86_64")
-
-          for os in "${oses[@]}"; do
-              if [[ $os == *"darwin"* ]]; then
-                  EXT="dylib"
-              else
-                  EXT="so"
-              fi
-              curl -L -o crsqlite-${os}.zip https://github.com/${{ inputs.repo }}/cr-sqlite/releases/download/${{ inputs.tag }}/crsqlite-${os}.zip
-              unzip -p crsqlite-${os}.zip > crates/corro-types/crsqlite-${os}.${EXT}
-              rm crsqlite-${os}.zip
-          done
+          TAG=${{ inputs.tag }} REPO=${INPUT_REPO} ./buildkite/download-crsqlite.sh
 
 
       - uses: EndBug/add-and-commit@v9
