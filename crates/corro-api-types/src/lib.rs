@@ -48,7 +48,7 @@ impl<T> TypedQueryEvent<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QueryEventMeta {
     Columns,
     Row(RowId),
@@ -220,6 +220,7 @@ pub struct ExecResponse {
     pub results: Vec<ExecResult>,
     pub time: f64,
     pub version: Option<u64>,
+    pub actor_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -510,7 +511,7 @@ impl SqliteValue {
         }
     }
 
-    pub fn as_ref(&self) -> SqliteValueRef {
+    pub fn as_ref(&self) -> SqliteValueRef<'_> {
         match self {
             SqliteValue::Null => SqliteValueRef(ValueRef::Null),
             SqliteValue::Integer(i) => SqliteValueRef(ValueRef::Integer(*i)),

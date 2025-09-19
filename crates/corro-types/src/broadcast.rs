@@ -1,11 +1,9 @@
-use std::{
-    cmp, fmt, io,
-    num::NonZeroU32,
-    ops::{Deref, RangeInclusive},
-    time::Duration,
-};
+use std::{cmp, fmt, io, num::NonZeroU32, num::ParseIntError, ops::Deref, time::Duration};
 
+use antithesis_sdk::assert_sometimes;
 use bytes::{Bytes, BytesMut};
+use corro_api_types::{ColumnName, SqliteValue};
+use corro_base_types::{CrsqlDbVersionRange, CrsqlSeqRange};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use itertools::Itertools;
 use metrics::counter;
@@ -21,12 +19,12 @@ use tokio::{
     task::block_in_place,
 };
 use tracing::{debug, error, trace};
-use uhlc::{ParseNTP64Error, NTP64};
+use uhlc::NTP64;
 
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     agent::Agent,
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    base::{CrsqlDbVersion, CrsqlSeq},
     change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
     sqlite::SqlitePoolError,
@@ -92,6 +90,15 @@ pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+pub struct ColumnChange {
+    pub cid: ColumnName,
+    pub val: SqliteValue,
+    pub col_version: i64,
+    pub seq: CrsqlSeq,
+    pub cl: i64,
+}
+
 #[derive(Debug, Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum ChangeSource {
@@ -99,7 +106,6 @@ pub enum ChangeSource {
     Sync,
 }
 
-// TODO: shrink this by mapping primary keys to integers instead of repeating them
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub struct ChangeV1 {
     pub actor_id: ActorId,
@@ -117,21 +123,21 @@ impl Deref for ChangeV1 {
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum Changeset {
     Empty {
-        versions: RangeInclusive<Version>,
+        versions: CrsqlDbVersionRange,
         #[speedy(default_on_eof)]
         ts: Option<Timestamp>,
     },
     Full {
-        version: Version,
+        version: CrsqlDbVersion,
         changes: Vec<Change>,
         // cr-sqlite sequences contained in this changeset
-        seqs: RangeInclusive<CrsqlSeq>,
+        seqs: CrsqlSeqRange,
         // last cr-sqlite sequence for the complete changeset
         last_seq: CrsqlSeq,
         ts: Timestamp,
     },
     EmptySet {
-        versions: Vec<RangeInclusive<Version>>,
+        versions: Vec<CrsqlDbVersionRange>,
         ts: Timestamp,
     },
 }
@@ -149,33 +155,32 @@ impl From<ChangesetParts> for Changeset {
 }
 
 pub struct ChangesetParts {
-    pub version: Version,
+    pub version: CrsqlDbVersion,
     pub changes: Vec<Change>,
-    pub seqs: RangeInclusive<CrsqlSeq>,
+    pub seqs: CrsqlSeqRange,
     pub last_seq: CrsqlSeq,
     pub ts: Timestamp,
 }
 
 impl Changeset {
-    pub fn versions(&self) -> RangeInclusive<Version> {
+    #[inline]
+    pub fn versions(&self) -> CrsqlDbVersionRange {
         match self {
-            Changeset::Empty { versions, .. } => versions.clone(),
+            Changeset::Empty { versions, .. } => *versions,
             // todo: this returns dummy version because empty set has an array of versions.
             // probably shouldn't be doing this
-            Changeset::EmptySet { .. } => Version(0)..=Version(0),
-            Changeset::Full { version, .. } => *version..=*version,
+            Changeset::EmptySet { .. } => CrsqlDbVersionRange::empty(),
+            Changeset::Full { version, .. } => CrsqlDbVersionRange::single(*version),
         }
     }
 
     // determine the estimated resource cost of processing a change
     pub fn processing_cost(&self) -> usize {
         match self {
-            Changeset::Empty { versions, .. } => {
-                cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)
-            }
+            Changeset::Empty { versions, .. } => cmp::min(versions.len(), 20),
             Changeset::EmptySet { versions, .. } => versions
                 .iter()
-                .map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20))
+                .map(|versions| cmp::min(versions.len(), 20))
                 .sum::<usize>(),
             Changeset::Full { changes, .. } => changes.len(),
         }
@@ -185,11 +190,12 @@ impl Changeset {
         self.changes().iter().map(|c| c.db_version).max()
     }
 
-    pub fn seqs(&self) -> Option<&RangeInclusive<CrsqlSeq>> {
+    #[inline]
+    pub fn seqs(&self) -> Option<CrsqlSeqRange> {
         match self {
             Changeset::Empty { .. } => None,
             Changeset::EmptySet { .. } => None,
-            Changeset::Full { seqs, .. } => Some(seqs),
+            Changeset::Full { seqs, .. } => Some(*seqs),
         }
     }
 
@@ -206,14 +212,14 @@ impl Changeset {
             Changeset::Empty { .. } => true,
             Changeset::EmptySet { .. } => true,
             Changeset::Full { seqs, last_seq, .. } => {
-                *seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq
+                seqs.start_int() == 0 && seqs.end_int() == last_seq.0
             }
         }
     }
 
     pub fn len(&self) -> usize {
         match self {
-            Changeset::Empty { .. } => 0, //(versions.end().0 - versions.start().0 + 1) as usize,
+            Changeset::Empty { .. } => 0,
             Changeset::EmptySet { versions, .. } => versions.len(),
             Changeset::Full { changes, .. } => changes.len(),
         }
@@ -275,7 +281,7 @@ impl Changeset {
 #[derive(Debug, thiserror::Error)]
 pub enum TimestampParseError {
     #[error("could not parse timestamp: {0:?}")]
-    Parse(ParseNTP64Error),
+    Parse(ParseIntError),
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd, Ord)]
@@ -293,7 +299,11 @@ impl Timestamp {
     }
 
     pub fn zero() -> Self {
-        Timestamp(NTP64(0))
+        Timestamp::from(0u64)
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.0 .0 == 0
     }
 }
 
@@ -337,12 +347,18 @@ impl From<NTP64> for Timestamp {
     }
 }
 
+impl From<u64> for Timestamp {
+    fn from(value: u64) -> Self {
+        Self(NTP64(value))
+    }
+}
+
 impl FromSql for Timestamp {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         match value {
             rusqlite::types::ValueRef::Text(b) => match std::str::from_utf8(b) {
-                Ok(s) => match s.parse::<NTP64>() {
-                    Ok(ntp) => Ok(Timestamp(ntp)),
+                Ok(s) => match s.parse::<u64>() {
+                    Ok(ntp) => Ok(Timestamp(NTP64(ntp))),
                     Err(e) => Err(FromSqlError::Other(Box::new(TimestampParseError::Parse(e)))),
                 },
                 Err(e) => Err(FromSqlError::Other(Box::new(e))),
@@ -355,7 +371,7 @@ impl FromSql for Timestamp {
 impl ToSql for Timestamp {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         Ok(rusqlite::types::ToSqlOutput::Owned(
-            rusqlite::types::Value::Text(self.0.to_string()),
+            rusqlite::types::Value::Text(self.0.as_u64().to_string()),
         ))
     }
 }
@@ -491,11 +507,11 @@ pub async fn broadcast_changes(
     agent: Agent,
     db_version: CrsqlDbVersion,
     last_seq: CrsqlSeq,
-    version: Version,
     ts: Timestamp,
 ) -> Result<(), BroadcastError> {
     let actor_id = agent.actor_id();
     let conn = agent.pool().read().await?;
+    trace!("got conn for broadcast");
 
     block_in_place(|| {
         // TODO: make this more generic so both sync and local changes can use it.
@@ -504,6 +520,7 @@ pub async fn broadcast_changes(
                 SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                     FROM crsql_changes
                     WHERE db_version = ?
+                    AND site_id = crsql_site_id()
                     ORDER BY seq ASC
             "#,
         )?;
@@ -523,13 +540,14 @@ pub async fn broadcast_changes(
                     match_changes(agent.updates_manager(), &changes, db_version);
 
                     let tx_bcast = agent.tx_bcast().clone();
+                    assert_sometimes!(true, "Corrosion broadcasts changes");
                     tokio::spawn(async move {
                         if let Err(e) = tx_bcast
                             .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
                                 ChangeV1 {
                                     actor_id,
                                     changeset: Changeset::Full {
-                                        version,
+                                        version: db_version,
                                         changes,
                                         seqs,
                                         last_seq,

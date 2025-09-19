@@ -21,7 +21,7 @@ use tokio::{
     sync::{RwLock, RwLockReadGuard},
     time::timeout,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 const HTTP2_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -53,9 +53,7 @@ impl CorrosionApiClient {
         statement: &Statement,
         timeout: Option<u64>,
     ) -> Result<QueryStream<T>, Error> {
-        let params = timeout
-            .map(|t| format!("?timeout={}", t))
-            .unwrap_or_default();
+        let params = timeout.map(|t| format!("?timeout={t}")).unwrap_or_default();
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(format!("http://{}/v1/queries{}", self.api_addr, params))
@@ -115,7 +113,7 @@ impl CorrosionApiClient {
             )
             .try_into()?
         } else {
-            format!("/v1/subscriptions?skip_rows={}", skip_rows).try_into()?
+            format!("/v1/subscriptions?skip_rows={skip_rows}").try_into()?
         };
         let url = hyper::Uri::builder()
             .scheme("http")
@@ -179,7 +177,7 @@ impl CorrosionApiClient {
             )
             .try_into()?
         } else {
-            format!("/v1/subscriptions/{id}?skip_rows={}", skip_rows).try_into()?
+            format!("/v1/subscriptions/{id}?skip_rows={skip_rows}").try_into()?
         };
         let url = hyper::Uri::builder()
             .scheme("http")
@@ -227,7 +225,7 @@ impl CorrosionApiClient {
         &self,
         table: &str,
     ) -> Result<UpdatesStream<T>, Error> {
-        let p_and_q: PathAndQuery = format!("/v1/updates/{}", table).try_into()?;
+        let p_and_q: PathAndQuery = format!("/v1/updates/{table}").try_into()?;
 
         let url = hyper::Uri::builder()
             .scheme("http")
@@ -275,7 +273,7 @@ impl CorrosionApiClient {
         } else {
             format!("http://{}/v1/transactions", self.api_addr)
         };
-        println!("uri: {:?}", uri);
+        // println!("uri: {:?}", uri);
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(uri)
@@ -289,17 +287,15 @@ impl CorrosionApiClient {
         if !status.is_success() {
             match hyper::body::to_bytes(res.into_body()).await {
                 Ok(b) => match serde_json::from_slice(&b) {
-                    Ok(res) => match res {
-                        ExecResponse { results, .. } => {
-                            if let Some(ExecResult::Error { error }) = results
-                                .into_iter()
-                                .find(|r| matches!(r, ExecResult::Error { .. }))
-                            {
-                                return Err(Error::ResponseError(error));
-                            }
-                            return Err(Error::UnexpectedStatusCode(status));
+                    Ok(ExecResponse { results, .. }) => {
+                        if let Some(ExecResult::Error { error }) = results
+                            .into_iter()
+                            .find(|r| matches!(r, ExecResult::Error { .. }))
+                        {
+                            return Err(Error::ResponseError(error));
                         }
-                    },
+                        return Err(Error::UnexpectedStatusCode(status));
+                    }
                     Err(e) => {
                         debug!(
                             error = %e,
@@ -344,80 +340,12 @@ impl CorrosionApiClient {
         &self,
         schema_paths: &[P],
     ) -> Result<Option<ExecResponse>, Error> {
-        let mut statements = vec![];
-
-        for schema_path in schema_paths.iter() {
-            match tokio::fs::metadata(schema_path).await {
-                Ok(meta) => {
-                    if meta.is_dir() {
-                        match tokio::fs::read_dir(schema_path).await {
-                            Ok(mut dir) => {
-                                let mut entries = vec![];
-
-                                while let Ok(Some(entry)) = dir.next_entry().await {
-                                    entries.push(entry);
-                                }
-
-                                let mut entries: Vec<_> = entries
-                                    .into_iter()
-                                    .filter_map(|entry| {
-                                        entry.path().extension().and_then(|ext| {
-                                            if ext == "sql" {
-                                                Some(entry)
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                    })
-                                    .collect();
-
-                                entries.sort_by_key(|entry| entry.path());
-
-                                for entry in entries.iter() {
-                                    match tokio::fs::read_to_string(entry.path()).await {
-                                        Ok(s) => {
-                                            statements.push(Statement::Simple(s));
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "could not read schema file '{}', error: {e}",
-                                                entry.path().display()
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "could not read dir '{}', error: {e}",
-                                    schema_path.as_ref().display()
-                                );
-                            }
-                        }
-                    } else if meta.is_file() {
-                        match tokio::fs::read_to_string(schema_path).await {
-                            Ok(s) => {
-                                statements.push(Statement::Simple(s));
-                                // pushed.push(schema_path.clone());
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "could not read schema file '{}', error: {e}",
-                                    schema_path.as_ref().display()
-                                );
-                            }
-                        }
-                    }
-                }
-
-                Err(e) => {
-                    warn!(
-                        "could not read schema file meta '{}', error: {e}",
-                        schema_path.as_ref().display()
-                    );
-                }
-            }
-        }
+        let statements: Vec<Statement> = corro_utils::read_files_from_paths(schema_paths)
+            .await
+            .map_err(|e| Error::ResponseError(e.to_string()))?
+            .into_iter()
+            .map(Statement::Simple)
+            .collect();
 
         if statements.is_empty() {
             return Ok(None);
@@ -441,6 +369,13 @@ impl CorrosionClient {
                 .max_size(5)
                 .create_pool()
                 .expect("could not build pool, this can't fail because we specified a runtime"),
+        }
+    }
+
+    pub fn with_sqlite_pool(api_addr: SocketAddr, pool: sqlite_pool::RusqlitePool) -> Self {
+        Self {
+            api_client: CorrosionApiClient::new(api_addr),
+            pool,
         }
     }
 

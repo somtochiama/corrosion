@@ -2,12 +2,14 @@
 
 use std::time::Instant;
 
+use crate::api::public::execute_schema;
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_maintenance},
         metrics, setup, util, AgentOptions,
     },
     broadcast::runtime_loop,
+    transport::Transport,
 };
 use corro_types::{
     actor::ActorId,
@@ -19,6 +21,7 @@ use corro_types::{
 
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use spawn::spawn_counted;
+use tokio::task::JoinHandle;
 use tracing::{error, info};
 use tripwire::Tripwire;
 
@@ -26,15 +29,23 @@ use tripwire::Tripwire;
 ///
 /// First initialise `AgentOptions` state via `setup()`, then spawn a
 /// new task that runs the main agent state machine
-pub async fn start_with_config(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Bookie)> {
+pub async fn start_with_config(
+    conf: Config,
+    tripwire: Tripwire,
+) -> eyre::Result<(Agent, Bookie, Transport, Vec<JoinHandle<()>>)> {
     let (agent, opts) = setup(conf.clone(), tripwire.clone()).await?;
+    let transport = opts.transport.clone();
 
-    let bookie = run(agent.clone(), opts, conf.perf).await?;
+    let (bookie, handles) = run(agent.clone(), opts, conf.perf).await?;
 
-    Ok((agent, bookie))
+    Ok((agent, bookie, transport, handles))
 }
 
-async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Result<Bookie> {
+async fn run(
+    agent: Agent,
+    opts: AgentOptions,
+    pconf: PerfConfig,
+) -> eyre::Result<(Bookie, Vec<JoinHandle<()>>)> {
     let AgentOptions {
         gossip_server_endpoint,
         transport,
@@ -45,7 +56,6 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         rx_apply,
         rx_clear_buf,
         rx_changes,
-        rx_emptyset,
         rx_foca,
         subs_manager,
         subs_bcast_cache,
@@ -58,13 +68,15 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
 
     //// Start PG server to accept query requests from PG clients
     // TODO: pull this out into a separate function?
-    if let Some(pg_conf) = agent.config().api.pg.clone() {
+    if let Some(pg_confs) = agent.config().api.pg.clone() {
         info!("Starting PostgreSQL wire-compatible server");
-        let pg_server = corro_pg::start(agent.clone(), pg_conf, tripwire.clone()).await?;
-        info!(
-            "Started PostgreSQL wire-compatible server, listening at {}",
-            pg_server.local_addr
-        );
+        for pg_conf in pg_confs {
+            let pg_server = corro_pg::start(agent.clone(), pg_conf, tripwire.clone()).await?;
+            info!(
+                "Started PostgreSQL wire-compatible server, listening at {}",
+                pg_server.local_addr
+            );
+        }
     }
 
     let (to_send_tx, to_send_rx) = bounded(pconf.to_send_channel_len, "to_send");
@@ -92,8 +104,17 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     // Load existing cluster members into the SWIM runtime
     util::initialise_foca(&agent).await;
 
+    // Load schema from paths
+    let stmts = corro_utils::read_files_from_paths(&agent.config().db.schema_paths).await?;
+    if !stmts.is_empty() {
+        if let Err(e) = execute_schema(&agent, stmts).await {
+            error!("could not execute schema: {e}");
+        }
+    }
+
+    let mut handles = vec![];
     // Setup client http API
-    util::setup_http_api_handler(
+    let mut http_handles = util::setup_http_api_handler(
         &agent,
         &tripwire,
         subs_bcast_cache,
@@ -102,6 +123,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         api_listeners,
     )
     .await?;
+    handles.append(&mut http_handles);
 
     tokio::spawn(util::clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
 
@@ -215,15 +237,11 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     //// future tree spawns additional message type sub-handlers
     handlers::spawn_gossipserver_handler(&agent, &bookie, &tripwire, gossip_server_endpoint);
 
-    spawn_counted(
+    let changes_handle = spawn_counted(
         handlers::handle_changes(agent.clone(), bookie.clone(), rx_changes, tripwire.clone())
             .inspect(|_| info!("corrosion handle changes loop is done")),
     );
+    handles.push(changes_handle);
 
-    spawn_counted(
-        handlers::handle_emptyset(agent.clone(), bookie.clone(), rx_emptyset, tripwire.clone())
-            .inspect(|_| info!("corrosion handle emptyset loop is done")),
-    );
-
-    Ok(bookie)
+    Ok((bookie, handles))
 }

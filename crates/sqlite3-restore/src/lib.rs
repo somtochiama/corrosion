@@ -64,6 +64,7 @@ pub fn restore<P1: AsRef<Path>, P2: AsRef<Path>>(
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(dst.as_ref())?;
 
     let src_meta = src_db_file.metadata()?;
@@ -92,11 +93,11 @@ pub fn restore<P1: AsRef<Path>, P2: AsRef<Path>>(
     if dst_locked.is_wal() {
         let dst_wal_path = format!("{}-wal", dst.as_ref().display());
         info!("truncating WAL file '{dst_wal_path}'");
-        let wal_file = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .open(PathBuf::from(dst_wal_path))?;
-        wal_file.set_len(0)?;
     }
 
     dst_db_file.seek(std::io::SeekFrom::Start(0))?;
@@ -178,6 +179,7 @@ pub fn lock_all<P: AsRef<Path>>(
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(PathBuf::from(format!("{}-shm", db_path.as_ref().display())))?;
 
     lock(&shm_file, LockType::Read, DMS, timeout)?;
@@ -224,7 +226,7 @@ fn lock(f: &File, l_type: LockType, l_start: i64, timeout: Duration) -> Result<(
             l_type: l_type as i16,
             l_whence: SEEK_SET as i16,
         };
-        match fcntl(f.as_raw_fd(), FcntlArg::F_SETLK(&flock)) {
+        match fcntl(f, FcntlArg::F_SETLK(&flock)) {
             Ok(_) => {
                 info!("lock acquired");
                 return Ok(());

@@ -16,7 +16,7 @@ use chrono::NaiveDateTime;
 use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, ChangeError},
-    broadcast::broadcast_changes,
+    broadcast::{broadcast_changes, Timestamp},
     change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
@@ -67,7 +67,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tokio_util::{codec::Framed, either::Either, sync::CancellationToken};
 use tracing::{debug, error, info, trace, warn};
-use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
+use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 
 use crate::{
     sql_state::SqlState,
@@ -179,7 +179,7 @@ enum Prepared {
         sql: String,
         param_types: Vec<Type>,
         fields: Vec<FieldInfo>,
-        cmd: ParsedCmd,
+        cmd: Box<ParsedCmd>,
     },
 }
 
@@ -191,7 +191,7 @@ enum Portal<'a> {
         stmt_name: CompactString,
         stmt: Statement<'a>,
         result_formats: Vec<FieldFormat>,
-        cmd: ParsedCmd,
+        cmd: Box<ParsedCmd>,
     },
 }
 
@@ -476,7 +476,7 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
     let ssl_required = tls.verify_client;
 
     let key = tokio::fs::read(&tls.key_file).await?;
-    let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
+    let key = if tls.key_file.extension() == Some("der") {
         rustls::PrivateKey(key)
     } else {
         let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
@@ -495,7 +495,7 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
     };
 
     let certs = tokio::fs::read(&tls.cert_file).await?;
-    let certs = if tls.cert_file.extension().map_or(false, |x| x == "der") {
+    let certs = if tls.cert_file.extension() == Some("der") {
         vec![rustls::Certificate(certs)]
     } else {
         rustls_pemfile::certs(&mut &*certs)?
@@ -517,7 +517,7 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
         };
 
         let ca_certs = tokio::fs::read(&ca_file).await?;
-        let ca_certs = if ca_file.extension().map_or(false, |x| x == "der") {
+        let ca_certs = if ca_file.extension() == Some("der") {
             vec![rustls::Certificate(ca_certs)]
         } else {
             rustls_pemfile::certs(&mut &*ca_certs)?
@@ -548,6 +548,7 @@ pub async fn start(
     pg: PgConfig,
     mut tripwire: Tripwire,
 ) -> Result<PgServer, PgStartError> {
+    let readonly = pg.readonly;
     let server = TcpListener::bind(pg.bind_addr).await?;
     let (tls_acceptor, ssl_required) = setup_tls(pg).await?;
     let local_addr = server.local_addr()?;
@@ -670,8 +671,9 @@ pub async fn start(
 
                 let cancel = CancellationToken::new();
 
-                tokio::spawn({
-                    let back_tx = back_tx.clone();
+                let mut frontend_task = tokio::spawn({
+                    // Use a weak sender here; it should NOT hold the backend channel (and half-connection) open
+                    let back_tx = back_tx.clone().downgrade();
                     let cancel = cancel.clone();
                     async move {
                         // cancel stuff if this loop breaks
@@ -687,20 +689,22 @@ pub async fn start(
                                 Err(e) => {
                                     warn!("could not receive pg frontend message: {e}");
                                     // attempt to send this...
-                                    _ = back_tx.try_send(
-                                        (
-                                            PgWireBackendMessage::ErrorResponse(
-                                                ErrorInfo::new(
-                                                    "FATAL".to_owned(),
-                                                    "XX000".to_owned(),
-                                                    e.to_string(),
-                                                )
+                                    if let Some(back_tx) = back_tx.upgrade() {
+                                        _ = back_tx.try_send(
+                                            (
+                                                PgWireBackendMessage::ErrorResponse(
+                                                    ErrorInfo::new(
+                                                        "FATAL".to_owned(),
+                                                        "XX000".to_owned(),
+                                                        e.to_string(),
+                                                    )
+                                                    .into(),
+                                                ),
+                                                true,
+                                            )
                                                 .into(),
-                                            ),
-                                            true,
-                                        )
-                                            .into(),
-                                    );
+                                        );
+                                    }
                                     break;
                                 }
                             };
@@ -713,7 +717,7 @@ pub async fn start(
                     }
                 });
 
-                tokio::spawn({
+                let mut backend_task = tokio::spawn({
                     let cancel = cancel.clone();
                     async move {
                         let _drop_guard = cancel.drop_guard();
@@ -736,6 +740,12 @@ pub async fn start(
                             }
                         }
                         debug!("backend stream is done");
+                        // If we get here, we know that `back_rx` has been fully drained.
+                        // Close the sink, this calls shutdown() on the underlying TCP socket
+                        // If the other side behaves correctly, the frontend task will eventually receive an EOF
+                        // and will also complete; by that point we know all messages have been sent successfully over TCP.
+                        // However, if this is not handled correctly we time out later.
+                        sink.close().await?;
                         Ok::<_, std::io::Error>(())
                     }
                 });
@@ -743,7 +753,11 @@ pub async fn start(
                 let res = tokio::task::spawn_blocking({
                     let back_tx = back_tx.clone();
                     move || {
-                        let conn = agent.pool().client_dedicated().unwrap();
+                        let conn = if readonly {
+                            agent.pool().client_dedicated_readonly().unwrap()
+                        } else {
+                            agent.pool().client_dedicated().unwrap()
+                        };
                         trace!("opened connection");
 
                         let int_handle = conn.get_interrupt_handle();
@@ -1011,7 +1025,7 @@ pub async fn start(
                                                     sql: parse.query().clone(),
                                                     param_types,
                                                     fields,
-                                                    cmd: parsed_cmd,
+                                                    cmd: Box::new(parsed_cmd),
                                                 },
                                             );
                                         }
@@ -1486,21 +1500,9 @@ pub async fn start(
                                                                     .raw_bind_parameter(idx, dt)?;
                                                             }
 
-                                                            // t @ &Type::TIMESTAMP => {
-                                                            //     let value: time::OffsetDateTime =
-                                                            //         from_type_and_format(
-                                                            //             t,
-                                                            //             b,
-                                                            //             format_code,
-                                                            //         )?;
-
-                                                            //     trace!("binding idx {idx} w/ value: {value}");
-                                                            //     prepped
-                                                            //         .raw_bind_parameter(idx, value)?;
-                                                            // }
-                                                            t => {
-                                                                warn!("unsupported type: {t:?}");
-                                                                back_tx.blocking_send(
+                                                        t => {
+                                                            warn!("unsupported type: {t:?}");
+                                                            back_tx.blocking_send(
                                                                 (
                                                                     PgWireBackendMessage::ErrorResponse(
                                                                         ErrorInfo::new(
@@ -1906,6 +1908,31 @@ pub async fn start(
                     }
                 }
 
+                // The message-handling loop has completed, make sure we also abort the tasks
+                // handling the TCP connection
+                // Firstly we attempt a graceful shutdown -- dropping back_tx will cause
+                // backend_task to complete once it writes all content to the TCP socket
+                // Then, frontend_task will eventually receive an EOF if clients behave properly
+                // Note that this should be the only reference of back_tx at this point:
+                // the one in frontend_task is weak, and the one cloned into the message-handling
+                // thread should have been dropped.
+                assert_eq!(back_tx.strong_count(), 1);
+                drop(back_tx);
+
+                // Now we wait for both front and back to complete; if however frontend_task never
+                // receives an EOF, instead of relying on half-open timeout we just abort both tasks
+                // after 1 minute.
+                match async { tokio::join!(&mut frontend_task, &mut backend_task) }
+                    .with_timeout(Duration::from_secs(60))
+                    .await
+                {
+                    Outcome::Preempted(_) => {
+                        frontend_task.abort();
+                        backend_task.abort();
+                    }
+                    Outcome::Completed(_) => {}
+                }
+
                 Ok::<_, BoxError>(())
             });
         }
@@ -2015,6 +2042,8 @@ impl<'conn> Session<'conn> {
                 trace!("query statement writes, acquiring permit...");
                 self.tx_state
                     .set_write_permit(self.agent.write_permit_blocking()?);
+
+                self.set_ts()?;
             }
 
             let mut rows = prepped.raw_query();
@@ -2130,6 +2159,8 @@ impl<'conn> Session<'conn> {
                 trace!("statement writes, acquiring permit...");
                 self.tx_state
                     .set_write_permit(self.agent.write_permit_blocking()?);
+
+                self.set_ts()?;
             }
             let mut rows = prepped.raw_query();
             loop {
@@ -2312,7 +2343,6 @@ impl<'conn> Session<'conn> {
             })?;
 
         if let Some(InsertChangesInfo {
-            version,
             db_version,
             last_seq,
             ts,
@@ -2325,10 +2355,19 @@ impl<'conn> Session<'conn> {
 
             let agent = self.agent.clone();
 
-            spawn_counted(async move {
-                broadcast_changes(agent, db_version, last_seq, version, ts).await
-            });
+            spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
         }
+
+        Ok(())
+    }
+
+    fn set_ts(&self) -> Result<(), rusqlite::Error> {
+        let ts = Timestamp::from(self.agent.clock().new_timestamp());
+
+        let _ = self
+            .conn
+            .prepare_cached("SELECT crsql_set_ts(?)")?
+            .query_row([&ts], |row| row.get::<_, String>(0))?;
 
         Ok(())
     }
@@ -2513,34 +2552,39 @@ fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
     })
 }
 
-fn compute_schema(conn: &Connection) -> Result<Schema, SchemaError> {
-    let mut dump = String::new();
+fn compute_schema(conn: &Connection) -> Result<Schema, Box<SchemaError>> {
+    fn dump_sql(conn: &Connection) -> Result<String, rusqlite::Error> {
+        let mut dump = String::new();
 
-    let tables: HashMap<String, String> = conn
-        .prepare(r#"SELECT name, sql FROM sqlite_schema WHERE type = "table" AND name IS NOT NULL AND sql IS NOT NULL ORDER BY tbl_name"#)?
-        .query_map((), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+        let tables: HashMap<String, String> = conn
+            .prepare(r#"SELECT name, sql FROM sqlite_schema WHERE type = "table" AND name IS NOT NULL AND sql IS NOT NULL ORDER BY tbl_name"#)?
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
 
-    for sql in tables.values() {
-        dump.push_str(sql.as_str());
-        dump.push(';');
+        for sql in tables.values() {
+            dump.push_str(sql.as_str());
+            dump.push(';');
+        }
+
+        let indexes: HashMap<String, String> = conn
+            .prepare(r#"SELECT name, sql FROM sqlite_schema WHERE type = "index" AND name IS NOT NULL AND sql IS NOT NULL ORDER BY tbl_name"#)?
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        for sql in indexes.values() {
+            dump.push_str(sql.as_str());
+            dump.push(';');
+        }
+
+        Ok(dump)
     }
 
-    let indexes: HashMap<String, String> = conn
-        .prepare(r#"SELECT name, sql FROM sqlite_schema WHERE type = "index" AND name IS NOT NULL AND sql IS NOT NULL ORDER BY tbl_name"#)?
-        .query_map((), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-
-    for sql in indexes.values() {
-        dump.push_str(sql.as_str());
-        dump.push(';');
-    }
-
-    parse_sql(dump.as_str())
+    let dump = dump_sql(conn).map_err(|err| Box::new(SchemaError::from(err)))?;
+    parse_sql(&dump)
 }
 
 #[derive(Debug)]
@@ -2549,7 +2593,7 @@ enum ParamKind<'a> {
     Positional,
 }
 
-fn as_param(expr: &Expr) -> Option<ParamKind> {
+fn as_param(expr: &Expr) -> Option<ParamKind<'_>> {
     if let Expr::Variable(name) = expr {
         if name.is_empty() {
             Some(ParamKind::Positional)
@@ -2582,6 +2626,7 @@ impl<'a> SqliteNameRef<'a> {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 enum SqliteName {
     Id(Id),
     Name(Name),
@@ -2589,7 +2634,7 @@ enum SqliteName {
     DoublyQualified(Name, Name, Name),
 }
 
-fn expr_to_name(expr: &Expr) -> Option<SqliteNameRef> {
+fn expr_to_name(expr: &Expr) -> Option<SqliteNameRef<'_>> {
     match expr {
         Expr::Id(id) => Some(SqliteNameRef::Id(id)),
         Expr::Name(name) => Some(SqliteNameRef::Name(name)),
@@ -3262,7 +3307,7 @@ fn field_types(
     let mut field_type_overrides = HashMap::new();
 
     match parsed_cmd {
-        ParsedCmd::Sqlite(Cmd::Stmt(stmt)) => match stmt {
+        ParsedCmd::Sqlite(Cmd::Stmt(
             Stmt::Select(Select {
                 body:
                     SelectBody {
@@ -3282,51 +3327,49 @@ fn field_types(
             | Stmt::Update {
                 returning: Some(cols),
                 ..
-            } => {
-                for (i, col) in cols.iter().enumerate() {
-                    if let ResultColumn::Expr(expr, _as) = col {
-                        let type_override = match expr {
-                            Expr::Cast { type_name, .. } => Some(name_to_type(&type_name.name)?),
-                            Expr::FunctionCall { name, .. }
-                            | Expr::FunctionCallStar { name, .. } => {
-                                match name.0.as_str().to_uppercase().as_ref() {
-                                    "COUNT" => Some(Type::INT8),
-                                    _ => None,
-                                }
-                            }
-                            Expr::Literal(lit) => match lit {
-                                Literal::Numeric(s) => Some(if s.contains('.') {
-                                    Type::FLOAT8
-                                } else {
-                                    Type::INT8
-                                }),
-                                Literal::String(_) => Some(Type::TEXT),
-                                Literal::Blob(_) => Some(Type::BYTEA),
-                                Literal::Keyword(_) => None,
-                                Literal::Null => None,
-                                Literal::CurrentDate => Some(Type::DATE),
-                                Literal::CurrentTime => Some(Type::TIME),
-                                Literal::CurrentTimestamp => Some(Type::TIMESTAMP),
-                            },
-                            _ => None,
-                        };
-                        if let Some(type_override) = type_override {
-                            match prepped.column_name(i) {
-                                Ok(col_name) => {
-                                    field_type_overrides.insert(col_name, type_override);
-                                }
-                                Err(e) => {
-                                    error!("col index didn't exist at {i}, attempted to override type as: {type_override}: {e}");
-                                }
+            },
+        )) => {
+            for (i, col) in cols.iter().enumerate() {
+                if let ResultColumn::Expr(expr, _as) = col {
+                    let type_override = match expr {
+                        Expr::Cast { type_name, .. } => Some(name_to_type(&type_name.name)?),
+                        Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => {
+                            match name.0.as_str().to_uppercase().as_ref() {
+                                "COUNT" => Some(Type::INT8),
+                                _ => None,
                             }
                         }
-                    } else {
-                        break;
+                        Expr::Literal(lit) => match lit {
+                            Literal::Numeric(s) => Some(if s.contains('.') {
+                                Type::FLOAT8
+                            } else {
+                                Type::INT8
+                            }),
+                            Literal::String(_) => Some(Type::TEXT),
+                            Literal::Blob(_) => Some(Type::BYTEA),
+                            Literal::Keyword(_) => None,
+                            Literal::Null => None,
+                            Literal::CurrentDate => Some(Type::DATE),
+                            Literal::CurrentTime => Some(Type::TIME),
+                            Literal::CurrentTimestamp => Some(Type::TIMESTAMP),
+                        },
+                        _ => None,
+                    };
+                    if let Some(type_override) = type_override {
+                        match prepped.column_name(i) {
+                            Ok(col_name) => {
+                                field_type_overrides.insert(col_name, type_override);
+                            }
+                            Err(e) => {
+                                error!("col index didn't exist at {i}, attempted to override type as: {type_override}: {e}");
+                            }
+                        }
                     }
+                } else {
+                    break;
                 }
             }
-            _ => {}
-        },
+        }
         ParsedCmd::Postgres(_stmt) => {
             // TODO: handle type overrides here too
             // let cols = match stmt {
@@ -3433,6 +3476,7 @@ mod tests {
             PgConfig {
                 bind_addr: "127.0.0.1:0".parse()?,
                 tls: tls_config,
+                readonly: false,
             },
             tripwire,
         )
@@ -3510,11 +3554,6 @@ mod tests {
             let row = client.query_one("SELECT * FROM crsql_changes", &[]).await?;
             println!("CHANGE ROW: {row:?}");
 
-            let row = client
-                .query_one("SELECT * FROM __corro_bookkeeping", &[])
-                .await?;
-            println!("BK ROW: {row:?}");
-
             client
                 .batch_execute("SELECT 1; SELECT 2; SELECT 3;")
                 .await?;
@@ -3570,13 +3609,12 @@ mod tests {
             println!("t2text: {:?}", row.try_get::<_, String>(2));
 
             let now: DateTime<Utc> = Utc::now();
-            let now = NaiveDateTime::from_timestamp_micros(now.timestamp_micros()).unwrap();
             println!("NOW: {now:?}");
 
             let row = client
                 .query_one(
                     "INSERT INTO kitchensink (other_ts, id, updated_at) VALUES (?1, ?2, ?1) RETURNING updated_at",
-                    &[&now, &1i64],
+                    &[&now.naive_utc(), &1i64],
                 )
                 .await?;
 
@@ -3584,16 +3622,18 @@ mod tests {
             let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
             println!("updated_at: {updated_at:?}");
 
-            assert_eq!(now, updated_at);
+            assert_eq!(
+                now.timestamp_micros(),
+                updated_at.and_utc().timestamp_micros()
+            );
 
             let future: DateTime<Utc> = Utc::now() + Duration::from_secs(1);
-            let future = NaiveDateTime::from_timestamp_micros(future.timestamp_micros()).unwrap();
             println!("NOW: {future:?}");
 
             let row = client
                 .query_one(
                     "UPDATE kitchensink SET other_ts = $ts, updated_at = $ts WHERE id = $id AND updated_at > ? RETURNING updated_at",
-                    &[&future, &1i64, &(now - Duration::from_secs(1))],
+                    &[&future.naive_utc(), &1i64, &(now - Duration::from_secs(1)).naive_utc()],
                 )
                 .await?;
 
@@ -3601,7 +3641,10 @@ mod tests {
             let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
             println!("updated_at: {updated_at:?}");
 
-            assert_eq!(future, updated_at);
+            assert_eq!(
+                future.timestamp_micros(),
+                updated_at.and_utc().timestamp_micros()
+            );
 
             let row = client
                 .query_one(
@@ -3610,6 +3653,75 @@ mod tests {
                 )
                 .await?;
             println!("COUNT ROW: {row:?}");
+        }
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pg_readonly() -> Result<(), BoxError> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let (ta, server) = setup_pg_test_server(tripwire.clone(), None).await?;
+
+        let readonly_server = start(
+            ta.agent.clone(),
+            PgConfig {
+                bind_addr: "127.0.0.1:0".parse()?,
+                tls: None,
+                readonly: true,
+            },
+            tripwire,
+        )
+        .await?;
+
+        // Do some writes first
+        {
+            let conn_str = format!(
+                "host={} port={} user=testuser",
+                server.local_addr.ip(),
+                server.local_addr.port()
+            );
+
+            let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
+            println!("client is ready!");
+            tokio::spawn(client_conn);
+            client
+                .execute("INSERT INTO tests VALUES (1,2)", &[])
+                .await?;
+        }
+
+        // Then use the readonly conn
+        {
+            let conn_str = format!(
+                "host={} port={} user=testuser",
+                readonly_server.local_addr.ip(),
+                readonly_server.local_addr.port()
+            );
+
+            let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
+            println!("readonly client is ready!");
+            tokio::spawn(client_conn);
+            assert_eq!(
+                client
+                    .query_one("SELECT * FROM tests", &[])
+                    .await
+                    .unwrap()
+                    .get::<_, String>(1),
+                "2"
+            );
+            assert!(client
+                .execute("INSERT INTO tests VALUES (3,4)", &[])
+                .await
+                .unwrap_err()
+                .as_db_error()
+                .unwrap()
+                .message()
+                .contains("readonly database"));
         }
 
         tripwire_tx.send(()).await.ok();
@@ -3662,7 +3774,7 @@ mod tests {
             server_cert_file: cert_file,
             server_key_file: key_file,
             ca_cert,
-            client_cert_signed: client_cert_signed,
+            client_cert_signed,
             client_key: client_cert.serialize_private_key_der(),
             ca_file,
         })

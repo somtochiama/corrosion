@@ -5,6 +5,7 @@ use std::{
 };
 
 use admin::AdminConn;
+// use antithesis_sdk::assert_sometimes;
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use command::{
@@ -17,7 +18,7 @@ use corro_client::CorrosionApiClient;
 use corro_types::{
     actor::{ActorId, ClusterId},
     api::{ExecResult, QueryEvent, Statement},
-    base::Version,
+    base::CrsqlDbVersion,
     config::{default_admin_path, Config, ConfigError, LogFormat, OtelConfig},
 };
 use futures::StreamExt;
@@ -157,6 +158,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
         }
 
         Command::Backup { path } => {
+            // assert_sometimes!(true, "Corrosion database is backed up");
             let db_path = cli.db_path()?;
 
             {
@@ -231,6 +233,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 eyre::bail!("corrosion is currently running, shut it down before restoring!");
             }
 
+            // assert_sometimes!(true, "Corrosion restores database from backup");
             let config = match cli.config() {
                 Ok(config) => config,
                 Err(_e) => {
@@ -490,7 +493,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             conn.send_command(corro_admin::Command::Actor(
                 corro_admin::ActorCommand::Version {
                     actor_id: ActorId(*actor_id),
-                    version: Version(*version),
+                    version: CrsqlDbVersion(*version),
                 },
             ))
             .await?;
@@ -511,6 +514,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(db_path)?;
 
             info!("Acquiring lock...");
@@ -754,7 +758,6 @@ enum ConsulCommand {
 enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
-    /// Reconcile gaps between memory and DB
     ReconcileGaps,
 }
 

@@ -2,10 +2,10 @@ use std::{
     collections::BTreeSet,
     net::SocketAddr,
     ops::Deref,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
+use antithesis_sdk::assert_sometimes;
 use axum::{extract::ConnectInfo, response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
@@ -15,7 +15,8 @@ use corro_types::{
         ColumnName, ExecResponse, ExecResult, QueryEvent, Statement, TableStatRequest,
         TableStatResponse,
     },
-    base::Version,
+    base::CrsqlDbVersion,
+    broadcast::Timestamp,
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
@@ -25,9 +26,7 @@ use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
-use sqlite_pool::{
-    Committable, InterruptibleStatement, InterruptibleTransaction, Statement as PoolStatement,
-};
+use sqlite_pool::{Committable, InterruptibleTransaction};
 
 use tokio::{
     sync::{
@@ -36,6 +35,7 @@ use tokio::{
     },
     task::block_in_place,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
@@ -54,7 +54,7 @@ pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
     timeout: Option<u64>,
     f: F,
-) -> Result<(T, Option<Version>, Duration), ChangeError>
+) -> Result<(T, Option<CrsqlDbVersion>, Duration), ChangeError>
 where
     F: Fn(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
 {
@@ -71,6 +71,8 @@ where
         .await;
 
     let start = Instant::now();
+    let ts = Timestamp::from(agent.clock().new_timestamp());
+
     block_in_place(move || {
         let tx = conn
             .immediate_transaction()
@@ -83,6 +85,20 @@ where
         let timeout = timeout.map(Duration::from_secs);
         let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
 
+        let _ = tx
+            .prepare_cached("SELECT crsql_set_ts(?)")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?
+            .query_row([&ts], |row| row.get::<_, String>(0))
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
+
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
 
@@ -90,7 +106,7 @@ where
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
-            version: insert_info.as_ref().map(|info| info.version),
+            version: insert_info.as_ref().map(|info| info.db_version),
         })?;
 
         let elapsed = start.elapsed();
@@ -100,7 +116,6 @@ where
         match insert_info {
             None => Ok((ret, None, elapsed)),
             Some(InsertChangesInfo {
-                version,
                 db_version,
                 last_seq,
                 ts,
@@ -112,11 +127,11 @@ where
 
                 let agent = agent.clone();
 
-                spawn_counted(async move {
-                    broadcast_changes(agent, db_version, last_seq, version, ts).await
-                });
+                spawn_counted(
+                    async move { broadcast_changes(agent, db_version, last_seq, ts).await },
+                );
 
-                Ok::<_, ChangeError>((ret, Some(version), elapsed))
+                Ok::<_, ChangeError>((ret, Some(db_version), elapsed))
             }
         }
     })
@@ -165,6 +180,7 @@ pub async fn api_v1_transactions(
     axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
+    let actor_id = agent.actor_id().to_string();
     if statements.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -174,10 +190,12 @@ pub async fn api_v1_transactions(
                 }],
                 time: 0.0,
                 version: None,
+                actor_id: Some(actor_id),
             }),
         );
     }
 
+    assert_sometimes!(true, "Corrosion receives transactions through HTTP API");
     let res = make_broadcastable_changes(&agent, params.timeout, move |tx| {
         let mut total_rows_affected = 0;
 
@@ -220,6 +238,7 @@ pub async fn api_v1_transactions(
                     }],
                     time: 0.0,
                     version: None,
+                    actor_id: Some(actor_id),
                 }),
             );
         }
@@ -231,6 +250,7 @@ pub async fn api_v1_transactions(
             results,
             time: elapsed.as_secs_f64(),
             version: version.map(Into::into),
+            actor_id: Some(actor_id),
         }),
     )
 }
@@ -272,7 +292,7 @@ async fn build_query_rows_response(
 
         let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
 
-        let prepped = match prepped_res {
+        let mut prepped = match prepped_res {
             Ok(prepped) => prepped,
             Err(e) => {
                 _ = res_tx.send(Err((
@@ -303,12 +323,23 @@ async fn build_query_rows_response(
         };
 
         let int_handle = conn.get_interrupt_handle();
-        let mut prepped = InterruptibleStatement::new(
-            PoolStatement(prepped),
-            Arc::new(int_handle),
-            timeout,
-            stmt.query().to_string(),
-        );
+        let token = CancellationToken::new();
+        if let Some(timeout) = timeout {
+            let cloned_token = token.clone();
+            let stmt_query = stmt.query().to_string();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = cloned_token.cancelled() => {}
+                    _ = tokio::time::sleep(timeout) => {
+                        warn!("sql call took more than {timeout:?}, interrupting stmt- {:?}", stmt_query);
+                        int_handle.interrupt();
+                        counter!("corro.sqlite.interrupt", "source" => "timeout").increment(1);
+                    }
+                };
+            });
+        }
+
+        let _dropguard = token.drop_guard();
         block_in_place(|| {
             let col_count = prepped.column_count();
             trace!("inside block in place, col count: {col_count}");
@@ -478,6 +509,7 @@ pub async fn api_v1_queries(
     });
 
     trace!("building query rows response...");
+    assert_sometimes!(true, "Corrosion accepts queries");
 
     match build_query_rows_response(&agent, client_addr, data_tx, stmt, params.timeout).await {
         Ok(_) => {
@@ -505,7 +537,7 @@ pub async fn api_v1_queries(
     }
 }
 
-async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
+pub(crate) async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
     let new_sql: String = statements.join(";");
 
     let partial_schema = parse_sql(&new_sql)?;
@@ -529,7 +561,9 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 
     new_schema.constrain()?;
 
-    block_in_place(|| {
+    // conn.trace(Some(|sql| debug!(sql)));
+
+    let apply_res = block_in_place(|| {
         let tx = conn.immediate_transaction()?;
 
         apply_schema(&tx, &schema_write, &mut new_schema)?;
@@ -543,8 +577,15 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 
         tx.commit()?;
 
+        // drain the pool of RO connections because they might not get the new tables in cr-sqlite!
+        agent.pool().drain_read();
+
         Ok::<_, eyre::Report>(())
-    })?;
+    });
+
+    // conn.trace(None);
+
+    apply_res?;
 
     *schema_write = new_schema;
 
@@ -555,6 +596,7 @@ pub async fn api_v1_db_schema(
     Extension(agent): Extension<Agent>,
     axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
+    let actor_id = agent.actor_id().to_string();
     if statements.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -564,12 +606,14 @@ pub async fn api_v1_db_schema(
                 }],
                 time: 0.0,
                 version: None,
+                actor_id: Some(actor_id),
             }),
         );
     }
 
     let start = Instant::now();
 
+    assert_sometimes!(true, "Corrosion applies schema");
     if let Err(e) = execute_schema(&agent, statements).await {
         error!("could not merge schemas: {e}");
         return (
@@ -580,6 +624,7 @@ pub async fn api_v1_db_schema(
                 }],
                 time: 0.0,
                 version: None,
+                actor_id: Some(actor_id),
             }),
         );
     }
@@ -590,6 +635,7 @@ pub async fn api_v1_db_schema(
             results: vec![],
             time: start.elapsed().as_secs_f64(),
             version: None,
+            actor_id: Some(actor_id),
         }),
     )
 }
@@ -658,16 +704,14 @@ pub async fn api_v1_table_stats(
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use corro_types::{
         api::RowId,
-        base::Version,
+        base::CrsqlDbVersion,
         broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset},
         config::Config,
         schema::SqliteType,
     };
-    use futures::Stream;
-    use http_body::{combinators::UnsyncBoxBody, Body};
+    use http_body::Body;
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
@@ -675,19 +719,6 @@ mod tests {
     use super::*;
 
     use crate::agent::setup;
-
-    struct UnsyncBodyStream(std::pin::Pin<Box<UnsyncBoxBody<Bytes, axum::Error>>>);
-
-    impl Stream for UnsyncBodyStream {
-        type Item = Result<Bytes, axum::Error>;
-
-        fn poll_next(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<Self::Item>> {
-            self.0.as_mut().poll_data(cx)
-        }
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_db_execute() -> eyre::Result<()> {
@@ -742,7 +773,7 @@ mod tests {
             msg,
             BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
                 changeset: Changeset::Full {
-                    version: Version(1),
+                    version: CrsqlDbVersion(1),
                     ..
                 },
                 ..
@@ -751,7 +782,7 @@ mod tests {
 
         assert_eq!(
             agent.booked().read::<&str, _>("test", None).await.last(),
-            Some(Version(1))
+            Some(CrsqlDbVersion(1))
         );
 
         println!("second req...");

@@ -3,7 +3,11 @@ name = "corro-agent"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
+antithesis_sdk = { workspace = true }
 arc-swap = { workspace = true }
 axum = { workspace = true }
 backoff = { path = "../backoff" }
@@ -13,6 +17,7 @@ camino = { workspace = true }
 compact_str = { workspace = true }
 config = { workspace = true }
 corro-types = { path = "../corro-types" }
+corro-utils = { path = "../corro-utils" }
 eyre = { workspace = true }
 foca = { workspace = true }
 futures = { workspace = true }
@@ -31,7 +36,7 @@ rand = { workspace = true }
 rangemap = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = "*"
+rustls-pemfile.workspace = true
 seahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

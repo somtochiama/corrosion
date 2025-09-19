@@ -1,7 +1,9 @@
+use crate::actor::ActorId;
 use crate::agent::SplitPool;
 use crate::change::Change;
 use crate::pubsub::{unpack_columns, MatchCandidates, MatchableChange, MatcherError};
 use crate::schema::Schema;
+use antithesis_sdk::assert_sometimes;
 use async_trait::async_trait;
 use corro_api_types::sqlite::ChangeType;
 use corro_api_types::{ColumnName, NotifyEvent, SqliteValueRef, TableName};
@@ -33,13 +35,13 @@ pub trait Manager<H> {
 #[async_trait]
 pub trait Handle {
     fn id(&self) -> Uuid;
-    fn cancelled(&self) -> WaitForCancellationFuture;
+    fn cancelled(&self) -> WaitForCancellationFuture<'_>;
     fn filter_matchable_change(
         &self,
         candidates: &mut MatchCandidates,
         change: MatchableChange,
     ) -> bool;
-    fn changes_tx(&self) -> mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>;
+    fn changes_tx(&self) -> mpsc::Sender<MatchCandidates>;
     async fn cleanup(&self);
     fn get_counter(&self, table: &str) -> &HandleMetrics;
 }
@@ -83,7 +85,7 @@ impl Handle for UpdateHandle {
         self.inner.id
     }
 
-    fn cancelled(&self) -> WaitForCancellationFuture {
+    fn cancelled(&self) -> WaitForCancellationFuture<'_> {
         self.inner.cancel.cancelled()
     }
 
@@ -118,7 +120,7 @@ impl Handle for UpdateHandle {
         }
     }
 
-    fn changes_tx(&self) -> mpsc::Sender<(MatchCandidates, CrsqlDbVersion)> {
+    fn changes_tx(&self) -> mpsc::Sender<MatchCandidates> {
         self.inner.changes_tx.clone()
     }
 
@@ -216,7 +218,7 @@ pub struct InnerUpdateHandle {
     id: Uuid,
     name: String,
     cancel: CancellationToken,
-    changes_tx: mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>,
+    changes_tx: mpsc::Sender<MatchCandidates>,
     counters: HandleMetrics,
 }
 
@@ -306,7 +308,7 @@ async fn batch_candidates(
     id: Uuid,
     cancel: CancellationToken,
     evt_tx: mpsc::Sender<NotifyEvent>,
-    mut changes_rx: mpsc::Receiver<(MatchCandidates, CrsqlDbVersion)>,
+    mut changes_rx: mpsc::Receiver<MatchCandidates>,
     mut tripwire: Tripwire,
 ) {
     const PROCESS_CHANGES_THRESHOLD: usize = 1000;
@@ -339,7 +341,7 @@ async fn batch_candidates(
                 info!(sub_id = %id, "Acknowledged updates cancellation, breaking loop.");
                 break;
             }
-            Some((candidates, _)) = changes_rx.recv() => {
+            Some(candidates) = changes_rx.recv() => {
                 debug!(sub_id = %id, "updates got candidates: {candidates:?}");
                 for (table, pk_map) in  candidates {
                     let buffed = buf.entry(table.clone()).or_default();
@@ -434,6 +436,7 @@ where
         return;
     }
 
+    assert_sometimes!(true, "Corrosion matches changes for updates");
     for (id, handle) in handles.iter() {
         trace!(sub_id = %id, %db_version, "attempting to match changes to a subscription");
         let mut candidates = MatchCandidates::new();
@@ -454,15 +457,18 @@ where
 
         trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
-        if let Err(e) = handle.changes_tx().try_send((candidates, db_version)) {
+        if let Err(e) = handle.changes_tx().try_send(candidates) {
             error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");
             match e {
                 mpsc::error::TrySendError::Full(item) => {
                     warn!("channel is full, falling back to async send");
 
                     let changes_tx = handle.changes_tx();
+                    let id = *id;
                     tokio::spawn(async move {
-                        _ = changes_tx.send(item).await;
+                        if let Err(e) = changes_tx.send(item).await {
+                            error!(sub_id = %id, "could not send match_change candidates to handler: {e}");
+                        }
                     });
                 }
                 mpsc::error::TrySendError::Closed(_) => {
@@ -481,6 +487,7 @@ pub fn match_changes_from_db_version<H>(
     manager: &impl Manager<H>,
     conn: &Connection,
     db_version: CrsqlDbVersion,
+    actor_id: ActorId,
 ) -> rusqlite::Result<()>
 where
     H: Handle + Send + 'static,
@@ -502,11 +509,12 @@ where
         SELECT "table", pk, cid, cl
             FROM crsql_changes
             WHERE db_version = ?
+              AND site_id = ?
             ORDER BY seq ASC
         "#,
         )?;
 
-        let rows = prepped.query_map([db_version], |row| {
+        let rows = prepped.query_map((db_version, actor_id), |row| {
             Ok((
                 row.get::<_, TableName>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -544,14 +552,17 @@ where
 
         trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
-        if let Err(e) = handle.changes_tx().try_send((candidates, db_version)) {
+        if let Err(e) = handle.changes_tx().try_send(candidates) {
             error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");
             match e {
                 mpsc::error::TrySendError::Full(item) => {
                     warn!("channel is full, falling back to async send");
                     let changes_tx = handle.changes_tx();
+                    let id = *id;
                     tokio::spawn(async move {
-                        _ = changes_tx.send(item).await;
+                        if let Err(e) = changes_tx.send(item).await {
+                            error!(sub_id = %id, "could not send change candidates to handler: {e}");
+                        }
                     });
                 }
                 mpsc::error::TrySendError::Closed(_) => {

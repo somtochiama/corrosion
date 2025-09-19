@@ -7,12 +7,18 @@ use serde_with::{formats::PreferOne, serde_as, OneOrMany};
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
 
+#[cfg(test)]
+pub const DEFAULT_MAX_SYNC_BACKOFF: u32 = 2;
+#[cfg(not(test))]
+pub const DEFAULT_MAX_SYNC_BACKOFF: u32 = 15;
+
 const fn default_apply_queue() -> usize {
     50
 }
 
 const fn default_wal_threshold() -> usize {
-    5
+    // Default of 5GB
+    5 * 1024
 }
 
 const fn default_processing_queue() -> usize {
@@ -43,6 +49,14 @@ const fn default_apply_timeout() -> usize {
 
 fn default_sql_tx_timeout() -> usize {
     60
+}
+
+fn default_min_sync_backoff() -> u32 {
+    1
+}
+
+fn default_max_sync_backoff() -> u32 {
+    DEFAULT_MAX_SYNC_BACKOFF
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,8 +145,9 @@ pub struct ApiConfig {
     pub bind_addr: Vec<SocketAddr>,
     #[serde(alias = "authz", default)]
     pub authorization: Option<AuthzConfig>,
+    #[serde_as(deserialize_as = "Option<OneOrMany<_, PreferOne>>")]
     #[serde(default)]
-    pub pg: Option<PgConfig>,
+    pub pg: Option<Vec<PgConfig>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +155,8 @@ pub struct PgConfig {
     #[serde(alias = "addr")]
     pub bind_addr: SocketAddr,
     pub tls: Option<PgTlsConfig>,
+    #[serde(default)]
+    pub readonly: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,11 +222,15 @@ pub struct PerfConfig {
     #[serde(default = "default_apply_queue")]
     pub apply_queue_len: usize,
     #[serde(default = "default_wal_threshold")]
-    pub wal_threshold_gb: usize,
+    pub wal_threshold_mb: usize,
     #[serde(default = "default_processing_queue")]
     pub processing_queue_len: usize,
     #[serde(default = "default_sql_tx_timeout")]
     pub sql_tx_timeout: usize,
+    #[serde(default = "default_min_sync_backoff")]
+    pub min_sync_backoff: u32,
+    #[serde(default = "default_max_sync_backoff")]
+    pub max_sync_backoff: u32,
 }
 
 impl Default for PerfConfig {
@@ -226,9 +247,11 @@ impl Default for PerfConfig {
             foca_channel_len: default_small_channel(),
             apply_queue_timeout: default_apply_timeout(),
             apply_queue_len: default_apply_queue(),
-            wal_threshold_gb: default_wal_threshold(),
+            wal_threshold_mb: default_wal_threshold(),
             processing_queue_len: default_processing_queue(),
             sql_tx_timeout: default_sql_tx_timeout(),
+            min_sync_backoff: default_min_sync_backoff(),
+            max_sync_backoff: default_max_sync_backoff(),
         }
     }
 }

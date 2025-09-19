@@ -2,9 +2,6 @@
 //!
 //! This module is _big_ and maybe should be split up further.
 
-use std::collections::HashMap;
-use std::ops::RangeInclusive;
-
 use std::{
     cmp,
     collections::VecDeque,
@@ -21,22 +18,20 @@ use crate::{
     api::peer::parallel_sync,
     transport::Transport,
 };
+use antithesis_sdk::assert_sometimes;
 use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{get_last_cleared_ts, Agent, Bookie, SplitPool},
+    agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset, FocaInput},
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
     channel::CorroReceiver,
     members::MemberAddedResult,
     sync::generate_sync,
 };
 
 use bytes::Bytes;
-use corro_types::agent::ChangeError;
-use corro_types::base::Version;
 use corro_types::broadcast::Timestamp;
-use corro_types::change::store_empty_changeset;
 use foca::Notification;
 use indexmap::map::Entry;
 use indexmap::IndexMap;
@@ -232,6 +227,8 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, mut tripwire
                             } else {
                                 debug!("successfully sent announce message");
                             }
+
+                            assert_sometimes!(true, "Corrosion bootstraps with other nodes")
                         }
                     }
                     Err(e) => {
@@ -295,26 +292,7 @@ pub async fn handle_notifications(
                         debug!("Member Added {actor:?}");
                         counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
 
-                        let last_cleared_ts = {
-                            match agent.pool().read().await {
-                                Ok(conn) => {
-                                    get_last_cleared_ts(&conn, actor.id()).unwrap_or_else(|e| {
-                                        error!("could not get last_empty_ts: {e}");
-                                        None
-                                    })
-                                }
-                                Err(e) => {
-                                    error!("could not get read conn: {e}");
-                                    None
-                                }
-                            }
-                        };
-
-                        let members_len = {
-                            let mut members = agent.members().write();
-                            members.update_last_empty(&actor.id(), last_cleared_ts);
-                            members.states.len() as u32
-                        };
+                        let members_len = { agent.members().read().states.len() as u32 };
 
                         // actually added a member
                         // notify of new cluster size
@@ -395,6 +373,7 @@ fn wal_checkpoint(conn: &rusqlite::Connection, timeout: u64) -> eyre::Result<()>
     debug!("handling db_cleanup (WAL truncation)");
     let start = Instant::now();
 
+    assert_sometimes!(true, "Corrosion truncates WAL");
     let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
     conn.pragma_update(None, "busy_timeout", timeout)?;
 
@@ -475,13 +454,13 @@ async fn vacuum_db(pool: &SplitPool, lim: u64) -> eyre::Result<()> {
 /// See `db_cleanup` and `vacuum_db`
 pub fn spawn_handle_db_maintenance(agent: &Agent) {
     let mut wal_path = agent.config().db.path.clone();
-    let wal_threshold = agent.config().perf.wal_threshold_gb as u64;
+    let wal_threshold = agent.config().perf.wal_threshold_mb as u64;
     wal_path.set_extension(format!("{}-wal", wal_path.extension().unwrap_or_default()));
 
     let pool = agent.pool().clone();
 
     tokio::spawn(async move {
-        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024 * 1024;
+        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024;
 
         // try to initially truncate the WAL
         match wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold).await
@@ -523,10 +502,18 @@ async fn wal_checkpoint_over_threshold(
     pool: &SplitPool,
     threshold: u64,
 ) -> eyre::Result<bool> {
-    let should_truncate = wal_path.metadata()?.len() > threshold;
+    let wal_size = wal_path.metadata()?.len();
+    let should_truncate = wal_size > threshold;
+
     if should_truncate {
+        let conn = if wal_size > (5 * threshold) {
+            warn!("wal_size is over 5x the threshold, trying to get a priority conn");
+            pool.write_priority().await?
+        } else {
+            pool.write_low().await?
+        };
+
         let timeout = calc_busy_timeout(wal_path.metadata()?.len(), threshold);
-        let conn = pool.write_low().await?;
         block_in_place(|| wal_checkpoint(&conn, timeout))?;
     }
     Ok(should_truncate)
@@ -540,216 +527,16 @@ fn calc_busy_timeout(wal_size: u64, threshold: u64) -> u64 {
         return base_timeout;
     }
 
-    // Double the timeout every 10gb and cap at 64 minutes
-    let diff = cmp::min(5, wal_size_gb / 10);
-    // add extra (five * diff) seconds for every extra 1gb over 10gb
-    let linear_increase = (wal_size_gb % 10) * 5000 * diff;
+    // Double the timeout every 5gb and cap at 16 minutes
+    let diff = cmp::min(5, (wal_size_gb - threshold_gb) / 5);
+    // add extra (five * diff) seconds for every extra 1gb over 4gb
+    let linear_increase = (wal_size_gb % 5) * 5000 * (diff + 1);
     let timeout = base_timeout * 2_u64.pow(diff as u32) + linear_increase;
     // we are using a 16min timeout, something is wrong if we get here
     if diff >= 5 {
         warn!("WAL size is too large, setting busy timeout {timeout}ms");
     }
     timeout
-}
-
-/// Handle incoming emptyset received during syncs
-///_
-#[allow(dead_code)]
-pub async fn handle_emptyset(
-    agent: Agent,
-    bookie: Bookie,
-    mut rx_emptysets: CorroReceiver<ChangeV1>,
-    mut tripwire: Tripwire,
-) {
-    type EmptyQueue = VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>;
-    let mut buf: HashMap<ActorId, EmptyQueue> = HashMap::new();
-
-    let mut join_set: JoinSet<HashMap<ActorId, EmptyQueue>> = JoinSet::new();
-
-    loop {
-        tokio::select! {
-            res = join_set.join_next(), if !join_set.is_empty() => {
-                debug!("processed emptysets!");
-                if let Some(Ok(res)) = res {
-                    for (actor_id, mut changes) in res {
-                        if !changes.is_empty() {
-                            let curr = buf.entry(actor_id).or_default();
-                            changes.append(curr);
-                            *curr = changes;
-                        }
-                    }
-                }
-            },
-            maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
-                Some(change) => {
-                    if let Changeset::EmptySet { versions, ts } = change.changeset {
-                        buf.entry(change.actor_id).or_default().push_back((versions.clone(), ts));
-                    } else {
-                        warn!("received non-emptyset changes in emptyset channel from {}", change.actor_id);
-                    }
-                },
-                None => break,
-            },
-            _ = &mut tripwire => {
-                break;
-            }
-        }
-
-        if join_set.is_empty() && !buf.is_empty() {
-            let mut to_process = std::mem::take(&mut buf);
-            let agent = agent.clone();
-            let bookie = bookie.clone();
-            join_set.spawn(async move {
-                for (actor, changes) in &mut to_process {
-                    while !changes.is_empty() {
-                        let change = changes.pop_front().unwrap();
-                        if let Some(booked) = bookie
-                            .read("process_emptyset(check ts)",actor.as_simple())
-                            .await
-                            .get(actor)
-                        {
-                            let booked_read = booked
-                                .read("process_emptyset(booked writer, ts timestamp)", actor.as_simple())
-                                .await;
-
-                            if let Some(seen_ts) = booked_read.last_cleared_ts() {
-                                if seen_ts > change.1 {
-                                    warn!("skipping change because last cleared ts '{:?}' is greater than empty ts: {:?}",
-                                        seen_ts, change.1);
-                                    continue;
-                                }
-                            }
-                        }
-                        match process_emptyset(agent.clone(), bookie.clone(), *actor, &change).await
-                        {
-                            Ok(()) => {}
-                            Err(e) => {
-                                warn!("encountered error when processing emptyset - {e}");
-                                changes.push_front(change);
-                                break;
-                            }
-                        }
-                    }
-                }
-                to_process
-            });
-        };
-    }
-
-    info!("shutting down handle empties loop");
-}
-
-#[allow(dead_code)]
-pub async fn process_emptyset(
-    agent: Agent,
-    bookie: Bookie,
-    actor_id: ActorId,
-    changes: &(Vec<RangeInclusive<Version>>, Timestamp),
-) -> Result<(), ChangeError> {
-    let (versions, ts) = changes;
-
-    let version_iter = versions.chunks(100);
-
-    for chunk in version_iter {
-        let mut conn = agent.pool().write_low().await?;
-        debug!("processing emptyset from {:?}", actor_id);
-        let booked = {
-            bookie
-                .write(
-                    "process_emptyset(booked writer, updates timestamp)",
-                    actor_id.as_simple(),
-                )
-                .await
-                .ensure(actor_id)
-        };
-
-        let mut booked_write = booked
-            .write(
-                "process_emptyset(booked writer, updates timestamp)",
-                actor_id.as_simple(),
-            )
-            .await;
-
-        let mut snap = booked_write.snapshot();
-
-        debug!(self_actor_id = %agent.actor_id(), "processing emptyset changes, len: {}", versions.len());
-        block_in_place(|| {
-            let tx = conn
-                .immediate_transaction()
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: None,
-                    version: None,
-                })?;
-
-            for version in chunk {
-                store_empty_changeset(&tx, actor_id, version.clone(), *ts)?;
-            }
-
-            snap.insert_db(&tx, RangeInclusiveSet::from_iter(chunk.iter().cloned()))
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: None,
-                    version: None,
-                })?;
-
-            tx.commit().map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: None,
-                version: None,
-            })?;
-
-            booked_write.commit_snapshot(snap);
-            counter!("corro.sync.empties.count", "actor" => format!("{}", actor_id.to_string()))
-                .increment(chunk.len() as u64);
-
-            Ok::<_, ChangeError>(())
-        })?;
-    }
-
-    let mut conn = agent.pool().write_low().await?;
-    let booked = {
-        bookie
-            .write(
-                "process_emptyset(booked writer, updates timestamp)",
-                actor_id.as_simple(),
-            )
-            .await
-            .ensure(actor_id)
-    };
-
-    let mut booked_write = booked
-        .write(
-            "process_emptyset(booked writer, updates timestamp)",
-            actor_id.as_simple(),
-        )
-        .await;
-
-    let tx = conn
-        .immediate_transaction()
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
-        })?;
-
-    let mut snap = booked_write.snapshot();
-    snap.update_cleared_ts(&tx, *ts)
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
-        })?;
-
-    tx.commit().map_err(|source| ChangeError::Rusqlite {
-        source,
-        actor_id: None,
-        version: None,
-    })?;
-
-    booked_write.commit_snapshot(snap);
-
-    Ok(())
 }
 
 /// Bundle incoming changes to optimise transaction sizes with SQLite
@@ -853,6 +640,7 @@ pub async fn handle_changes(
                 if buf_cost < max_changes_chunk && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
                     // we can process this right away
                     debug!(%buf_cost, "spawning processing multiple changes from max wait interval");
+                    assert_sometimes!(true, "Corrosion processes changes");
                     let changes: Vec<_> = queue.drain(..).collect();
                     let agent = agent.clone();
                     let bookie = bookie.clone();
@@ -863,7 +651,7 @@ pub async fn handle_changes(
 
                 if seen.len() > max_seen_cache_len {
                     // we don't want to keep too many entries in here.
-                    seen = seen.split_off(seen.len() - keep_seen_cache_size);
+                    seen.drain(..seen.len() - keep_seen_cache_size);
                 }
                 continue
             },
@@ -880,26 +668,37 @@ pub async fn handle_changes(
             continue;
         }
 
-        if let Some(mut seqs) = change.seqs().cloned() {
-            let v = *change.versions().start();
+        if let Some(mut seqs) = change.seqs() {
+            let v = change.versions().start();
             if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
                 if seqs.all(|seq| seen_seqs.contains(&seq)) {
                     continue;
                 }
             }
-        } else {
-            // empty versions
-            if change
-                .versions()
-                .all(|v| seen.contains_key(&(change.actor_id, v)))
-            {
-                continue;
+        } else if change
+            .versions()
+            .all(|v| seen.contains_key(&(change.actor_id, v)))
+        {
+            if matches!(src, ChangeSource::Broadcast) {
+                counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
             }
+            continue;
         }
 
-        let recv_lag = change
-            .ts()
-            .map(|ts| (agent.clock().new_timestamp().get_time() - ts.0).to_duration());
+        let src_str: &'static str = src.into();
+        let recv_lag = change.ts().and_then(|ts| {
+            let mut our_ts = Timestamp::from(agent.clock().new_timestamp());
+            if ts > our_ts {
+                if let Err(e) = agent.update_clock_with_timestamp(change.actor_id, ts) {
+                    error!("could not update clock from actor {}: {e}", change.actor_id);
+                    return None;
+                }
+                counter!("corro.agent.clock.update", "source" => src_str).increment(1);
+                // update our_ts to the new timestamp
+                our_ts = Timestamp::from(agent.clock().new_timestamp());
+            }
+            Some((our_ts.0 - ts.0).to_duration())
+        });
 
         if matches!(src, ChangeSource::Broadcast) {
             counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
@@ -920,6 +719,9 @@ pub async fn handle_changes(
                 .contains_all(change.versions(), change.seqs())
             {
                 trace!("already seen, stop disseminating");
+                if matches!(src, ChangeSource::Broadcast) {
+                    counter!("corro.broadcast.duplicate.count", "from" => "bookie").increment(1);
+                }
                 continue;
             }
         }
@@ -930,10 +732,10 @@ pub async fn handle_changes(
             if let Some((dropped_change, _, _)) = queue.pop_front() {
                 for v in dropped_change.versions() {
                     if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
-                        if let Some(seqs) = dropped_change.seqs().cloned() {
-                            entry.get_mut().remove(seqs);
+                        if let Some(seqs) = dropped_change.seqs() {
+                            entry.get_mut().remove(seqs.into());
                         } else {
-                            entry.remove_entry();
+                            entry.swap_remove_entry();
                         }
                     };
                 }
@@ -947,7 +749,6 @@ pub async fn handle_changes(
         }
 
         if let Some(recv_lag) = recv_lag {
-            let src_str: &'static str = src.into();
             histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str)
                 .record(recv_lag.as_secs_f64());
         }
@@ -955,12 +756,17 @@ pub async fn handle_changes(
         // this will only run once for a non-empty changeset
         for v in change.versions() {
             let entry = seen.entry((change.actor_id, v)).or_default();
-            if let Some(seqs) = change.seqs().cloned() {
-                entry.extend([seqs]);
+            if let Some(seqs) = change.seqs() {
+                entry.extend([seqs.into()]);
             }
         }
 
+        assert_sometimes!(
+            matches!(src, ChangeSource::Sync),
+            "Corrosion receives changes through sync"
+        );
         if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
+            assert_sometimes!(true, "Corrosion rebroadcasts changes");
             if let Err(_e) =
                 agent
                     .tx_bcast()
@@ -1028,7 +834,8 @@ pub async fn handle_sync(
 
         debug!("found {} candidates to synchronize with", candidates.len());
 
-        let desired_count = cmp::max(cmp::min(candidates.len() / 100, 10), 3);
+        assert_sometimes!(true, "Corrosion syncs with other nodes");
+        let desired_count = (candidates.len() / 100).clamp(3, 10);
         debug!("Selected {desired_count} nodes to sync with");
 
         let mut rng = StdRng::from_entropy();
@@ -1060,19 +867,8 @@ pub async fn handle_sync(
         return Ok(());
     }
 
-    let mut last_cleared: HashMap<ActorId, Option<Timestamp>> = HashMap::new();
-
-    for (actor_id, _) in chosen.clone() {
-        let last_ts = match agent.members().read().states.get(&actor_id) {
-            Some(state) => state.last_empty_ts,
-            None => None,
-        };
-
-        last_cleared.insert(actor_id, last_ts);
-    }
-
     let start = Instant::now();
-    let n = match parallel_sync(agent, transport, chosen.clone(), sync_state, last_cleared).await {
+    let n = match parallel_sync(agent, transport, chosen.clone(), sync_state).await {
         Ok(n) => n,
         Err(e) => {
             error!("failed to execute parallel sync: {e:?}");
@@ -1107,7 +903,11 @@ mod tests {
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{ColumnName, TableName};
     use corro_types::{
-        base::CrsqlDbVersion, base::Version, change::Change, config::Config, pubsub::pack_columns,
+        base::{dbsr, dbvr, CrsqlDbVersion},
+        broadcast::Changeset,
+        change::Change,
+        config::Config,
+        pubsub::pack_columns,
     };
     use rusqlite::Connection;
     use std::sync::Arc;
@@ -1187,9 +987,9 @@ mod tests {
                     ChangeV1 {
                         actor_id: other_actor,
                         changeset: Changeset::Full {
-                            version: Version(i as u64),
+                            version: CrsqlDbVersion(i as u64),
                             changes: vec![crsql_row.clone()],
-                            seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                            seqs: dbsr!(0, 0),
                             last_seq: CrsqlSeq(0),
                             ts: agent.clock().new_timestamp().into(),
                         },
@@ -1209,10 +1009,10 @@ mod tests {
             .unwrap()
             .read::<&str, _>("test", None)
             .await;
-        assert!(booked.contains_all(Version(6)..=Version(10), None));
-        assert!(booked.contains_all(Version(1)..=Version(3), None));
-        assert!(!booked.contains_version(&Version(5)));
-        assert!(!booked.contains_version(&Version(4)));
+        assert!(booked.contains_all(dbvr!(6, 10), None));
+        assert!(booked.contains_all(dbvr!(1, 3), None));
+        assert!(!booked.contains_version(&CrsqlDbVersion(5)));
+        assert!(!booked.contains_version(&CrsqlDbVersion(4)));
 
         Ok(())
     }
@@ -1220,14 +1020,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn ensure_vacuum_works() -> eyre::Result<()> {
         let tmpdir = tempfile::tempdir()?;
-        let db_path = tmpdir.into_path().join("db.sqlite");
+        let db_path = tmpdir.keep().join("db.sqlite");
 
         {
             let db_conn = Connection::open(db_path.clone())?;
             db_conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
         }
 
-        println!("temp db: {:?}", db_path);
+        println!("temp db: {db_path:?}");
         let write_sema = Arc::new(Semaphore::new(1));
         let pool = SplitPool::create(db_path, write_sema.clone()).await?;
 
@@ -1277,29 +1077,36 @@ mod tests {
         assert_eq!(calc_busy_timeout(to_bytes(1), to_bytes(5)), 30000); // 30s
         assert_eq!(calc_busy_timeout(to_bytes(4), to_bytes(5)), 30000); // 30s
         assert_eq!(calc_busy_timeout(to_bytes(5), to_bytes(5)), 30000); // 30s
-        assert_eq!(calc_busy_timeout(to_bytes(9), to_bytes(5)), 30000); // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(9), to_bytes(5)), 50000); // 50s
 
-        // At 10GB we hit first doubling + linear increases (5s per GB)
+        // At 10GB we hit first doubling + linear increases (10s per GB)
         assert_eq!(calc_busy_timeout(to_bytes(10), to_bytes(5)), 60000); // 1m
-        assert_eq!(calc_busy_timeout(to_bytes(11), to_bytes(5)), 65000); // 1m10s
-        assert_eq!(calc_busy_timeout(to_bytes(15), to_bytes(5)), 85000); // 1m50s
+        assert_eq!(calc_busy_timeout(to_bytes(11), to_bytes(5)), 70000); // 1m10s
 
-        // At 20GB we hit second doubling + linear increases (10s per GB)
-        assert_eq!(calc_busy_timeout(to_bytes(20), to_bytes(5)), 120000); // 2m
-        assert_eq!(calc_busy_timeout(to_bytes(21), to_bytes(5)), 130000); // 2m10s
-        assert_eq!(calc_busy_timeout(to_bytes(25), to_bytes(5)), 170000); // 2m50s
+        // At 15GB we hit second doubling + linear increases (15s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(15), to_bytes(5)), 120000); // 2m
+        assert_eq!(calc_busy_timeout(to_bytes(17), to_bytes(5)), 150000); // 2m30s
+        assert_eq!(calc_busy_timeout(to_bytes(19), to_bytes(5)), 180000); // 3m
 
-        // At 30GB we hit third doubling + linear increases (15s per GB)
-        assert_eq!(calc_busy_timeout(to_bytes(30), to_bytes(5)), 240000); // 4m
-        assert_eq!(calc_busy_timeout(to_bytes(31), to_bytes(5)), 255000); // 4m15s
+        // At 20GB we hit third doubling + linear increases (20s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(20), to_bytes(5)), 240000); // 4m
+        assert_eq!(calc_busy_timeout(to_bytes(21), to_bytes(5)), 260000); // 4m20s
 
-        // At 40GB we hit fourth doubling + linear increases (20s per GB)
-        assert_eq!(calc_busy_timeout(to_bytes(40), to_bytes(5)), 480000); // 8m
-        assert_eq!(calc_busy_timeout(to_bytes(41), to_bytes(5)), 500000); // 8m20s
+        // At 25GB we hit third doubling + linear increases (25s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(25), to_bytes(5)), 480000); // 8m
+        assert_eq!(calc_busy_timeout(to_bytes(27), to_bytes(5)), 530000); // 8m50s
+
+        // At 30GB we hit third doubling + linear increases (30s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(30), to_bytes(5)), 960000); // 16m
+        assert_eq!(calc_busy_timeout(to_bytes(31), to_bytes(5)), 990000); // 16m30s
+
+        // At 40GB we hit the cap + linear increases (40s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(40), to_bytes(5)), 960000); // 16m
+        assert_eq!(calc_busy_timeout(to_bytes(41), to_bytes(5)), 990000); // 16m30s
 
         // At 50GB we hit fifth doubling and cap at 16m
         assert_eq!(calc_busy_timeout(to_bytes(50), to_bytes(5)), 960000); // 16m
-        assert_eq!(calc_busy_timeout(to_bytes(51), to_bytes(5)), 985000); // 16m25s (capped)
+        assert_eq!(calc_busy_timeout(to_bytes(51), to_bytes(5)), 990000); // 16m25s (capped)
         assert_eq!(calc_busy_timeout(to_bytes(100), to_bytes(5)), 960000); // 16m (capped)
     }
 

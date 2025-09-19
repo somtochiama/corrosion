@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::{
     actor::ActorId,
     agent::{Booked, Bookie},
-    base::{CrsqlSeq, Version},
+    base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
     broadcast::{ChangeV1, Timestamp},
 };
 
@@ -79,9 +79,9 @@ pub enum SyncRejectionV1 {
 #[derive(Debug, Default, Clone, PartialEq, Readable, Writable, Serialize, Deserialize)]
 pub struct SyncStateV1 {
     pub actor_id: ActorId,
-    pub heads: HashMap<ActorId, Version>,
-    pub need: HashMap<ActorId, Vec<RangeInclusive<Version>>>,
-    pub partial_need: HashMap<ActorId, HashMap<Version, Vec<RangeInclusive<CrsqlSeq>>>>,
+    pub heads: HashMap<ActorId, CrsqlDbVersion>,
+    pub need: HashMap<ActorId, Vec<RangeInclusive<CrsqlDbVersion>>>,
+    pub partial_need: HashMap<ActorId, HashMap<CrsqlDbVersion, Vec<RangeInclusive<CrsqlSeq>>>>,
     #[speedy(default_on_eof)]
     pub last_cleared_ts: Option<Timestamp>,
 }
@@ -134,12 +134,13 @@ impl SyncStateV1 {
             if *actor_id == self.actor_id {
                 continue;
             }
-            if *head == Version(0) {
+            if *head == CrsqlDbVersion(0) {
                 warn!(actor_id = %other.actor_id, "sent a 0 head version for actor id {}", actor_id);
                 continue;
             }
             let other_haves = {
-                let mut haves = RangeInclusiveSet::from_iter([(Version(1)..=*head)].into_iter());
+                let mut haves =
+                    RangeInclusiveSet::from_iter([(CrsqlDbVersion(1)..=*head)].into_iter());
 
                 // remove needs
                 if let Some(other_need) = other.need.get(actor_id) {
@@ -166,7 +167,7 @@ impl SyncStateV1 {
                         let start = cmp::max(range.start(), overlap.start());
                         let end = cmp::min(range.end(), overlap.end());
                         needs.entry(*actor_id).or_default().push(SyncNeedV1::Full {
-                            versions: *start..=*end,
+                            versions: CrsqlDbVersionRange::new(*start, *end),
                         })
                     }
                 }
@@ -180,7 +181,7 @@ impl SyncStateV1 {
                             .or_default()
                             .push(SyncNeedV1::Partial {
                                 version: *v,
-                                seqs: seqs.clone(),
+                                seqs: seqs.iter().map(CrsqlSeqRange::from).collect(),
                             });
                     } else if let Some(other_seqs) = other
                         .partial_need
@@ -203,16 +204,13 @@ impl SyncStateV1 {
                             let seqs = seqs
                                 .iter()
                                 .flat_map(|range| {
-                                    other_seqs_haves
-                                        .overlapping(range)
-                                        .map(|overlap| {
-                                            let start = cmp::max(range.start(), overlap.start());
-                                            let end = cmp::min(range.end(), overlap.end());
-                                            *start..=*end
-                                        })
-                                        .collect::<Vec<RangeInclusive<CrsqlSeq>>>()
+                                    other_seqs_haves.overlapping(range).map(|overlap| {
+                                        let start = cmp::max(range.start(), overlap.start());
+                                        let end = cmp::min(range.end(), overlap.end());
+                                        CrsqlSeqRange::new(*start, *end)
+                                    })
                                 })
-                                .collect::<Vec<RangeInclusive<CrsqlSeq>>>();
+                                .collect::<Vec<CrsqlSeqRange>>();
 
                             if !seqs.is_empty() {
                                 needs
@@ -233,14 +231,13 @@ impl SyncStateV1 {
                         None
                     }
                 }
-                None => Some(Version(1)..=*head),
+                None => Some(CrsqlDbVersion(1)..=*head),
             };
 
             if let Some(missing) = missing {
-                needs
-                    .entry(*actor_id)
-                    .or_default()
-                    .push(SyncNeedV1::Full { versions: missing });
+                needs.entry(*actor_id).or_default().push(SyncNeedV1::Full {
+                    versions: missing.into(),
+                });
             }
         }
 
@@ -251,11 +248,11 @@ impl SyncStateV1 {
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum SyncNeedV1 {
     Full {
-        versions: RangeInclusive<Version>,
+        versions: CrsqlDbVersionRange,
     },
     Partial {
-        version: Version,
-        seqs: Vec<RangeInclusive<CrsqlSeq>>,
+        version: CrsqlDbVersion,
+        seqs: Vec<CrsqlSeqRange>,
     },
     Empty {
         ts: Option<Timestamp>,
@@ -263,9 +260,10 @@ pub enum SyncNeedV1 {
 }
 
 impl SyncNeedV1 {
+    #[inline]
     pub fn count(&self) -> usize {
         match self {
-            SyncNeedV1::Full { versions } => (versions.end().0 - versions.start().0) as usize + 1,
+            SyncNeedV1::Full { versions } => versions.len(),
             SyncNeedV1::Partial { .. } => 1,
             SyncNeedV1::Empty { .. } => 1,
         }
@@ -295,12 +293,10 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
             .collect()
     };
 
-    let mut last_ts = None;
-
     for (actor_id, booked) in actors {
         let bookedr = booked.read("generate_sync", actor_id.as_simple()).await;
 
-        let last_version = match { bookedr.last() } {
+        let last_version = match bookedr.last() {
             None => continue,
             Some(v) => v,
         };
@@ -327,15 +323,8 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
                 );
             }
         }
-
-        if actor_id == self_actor_id {
-            last_ts = bookedr.last_cleared_ts();
-        }
-
         state.heads.insert(actor_id, last_version);
     }
-
-    state.last_cleared_ts = last_ts;
 
     state
 }
@@ -387,6 +376,7 @@ impl SyncMessage {
 
 #[cfg(test)]
 mod tests {
+    use crate::base::{dbsr, dbsri, dbvr, dbvri};
     use uuid::Uuid;
 
     use super::*;
@@ -396,32 +386,24 @@ mod tests {
         let actor1 = ActorId(Uuid::new_v4());
 
         let mut our_state = SyncStateV1::default();
-        our_state.heads.insert(actor1, Version(10));
+        our_state.heads.insert(actor1, CrsqlDbVersion(10));
 
         let mut other_state = SyncStateV1::default();
-        other_state.heads.insert(actor1, Version(13));
+        other_state.heads.insert(actor1, CrsqlDbVersion(13));
 
         assert_eq!(
             our_state.compute_available_needs(&other_state),
             [(
                 actor1,
                 vec![SyncNeedV1::Full {
-                    versions: Version(11)..=Version(13)
+                    versions: dbvr!(11, 13)
                 }]
             )]
             .into()
         );
 
-        our_state
-            .need
-            .entry(actor1)
-            .or_default()
-            .push(Version(2)..=Version(5));
-        our_state
-            .need
-            .entry(actor1)
-            .or_default()
-            .push(Version(7)..=Version(7));
+        our_state.need.entry(actor1).or_default().push(dbvri!(2, 5));
+        our_state.need.entry(actor1).or_default().push(dbvri!(7, 7));
 
         assert_eq!(
             our_state.compute_available_needs(&other_state),
@@ -429,13 +411,13 @@ mod tests {
                 actor1,
                 vec![
                     SyncNeedV1::Full {
-                        versions: Version(2)..=Version(5)
+                        versions: dbvr!(2, 5)
                     },
                     SyncNeedV1::Full {
-                        versions: Version(7)..=Version(7)
+                        versions: dbvr!(7, 7)
                     },
                     SyncNeedV1::Full {
-                        versions: Version(11)..=Version(13)
+                        versions: dbvr!(11, 13)
                     }
                 ]
             )]
@@ -444,11 +426,7 @@ mod tests {
 
         our_state.partial_need.insert(
             actor1,
-            [(
-                Version(9),
-                vec![CrsqlSeq(100)..=CrsqlSeq(120), CrsqlSeq(130)..=CrsqlSeq(132)],
-            )]
-            .into(),
+            [(CrsqlDbVersion(9), vec![dbsri!(100, 120), dbsri!(130, 132)])].into(),
         );
 
         assert_eq!(
@@ -457,17 +435,17 @@ mod tests {
                 actor1,
                 vec![
                     SyncNeedV1::Full {
-                        versions: Version(2)..=Version(5)
+                        versions: dbvr!(2, 5)
                     },
                     SyncNeedV1::Full {
-                        versions: Version(7)..=Version(7)
+                        versions: dbvr!(7, 7)
                     },
                     SyncNeedV1::Partial {
-                        version: Version(9),
-                        seqs: vec![CrsqlSeq(100)..=CrsqlSeq(120), CrsqlSeq(130)..=CrsqlSeq(132)]
+                        version: CrsqlDbVersion(9),
+                        seqs: vec![dbsr!(100, 120), dbsr!(130, 132)]
                     },
                     SyncNeedV1::Full {
-                        versions: Version(11)..=Version(13)
+                        versions: dbvr!(11, 13)
                     }
                 ]
             )]
@@ -476,11 +454,7 @@ mod tests {
 
         other_state.partial_need.insert(
             actor1,
-            [(
-                Version(9),
-                vec![CrsqlSeq(100)..=CrsqlSeq(110), CrsqlSeq(130)..=CrsqlSeq(130)],
-            )]
-            .into(),
+            [(CrsqlDbVersion(9), vec![dbsri!(100, 110), dbsri!(130, 130)])].into(),
         );
 
         assert_eq!(
@@ -489,17 +463,17 @@ mod tests {
                 actor1,
                 vec![
                     SyncNeedV1::Full {
-                        versions: Version(2)..=Version(5)
+                        versions: dbvr!(2, 5)
                     },
                     SyncNeedV1::Full {
-                        versions: Version(7)..=Version(7)
+                        versions: dbvr!(7, 7)
                     },
                     SyncNeedV1::Partial {
-                        version: Version(9),
-                        seqs: vec![CrsqlSeq(111)..=CrsqlSeq(120), CrsqlSeq(131)..=CrsqlSeq(132)]
+                        version: CrsqlDbVersion(9),
+                        seqs: vec![dbsr!(111, 120), dbsr!(131, 132)]
                     },
                     SyncNeedV1::Full {
-                        versions: Version(11)..=Version(13)
+                        versions: dbvr!(11, 13)
                     }
                 ]
             )]

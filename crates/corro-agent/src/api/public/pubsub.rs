@@ -128,9 +128,9 @@ fn make_query_event_bytes(
     Ok((buf.split().freeze(), query_evt.meta()))
 }
 
-const MAX_UNSUB_TIME: Duration = Duration::from_secs(120);
+const MAX_UNSUB_TIME: Duration = Duration::from_secs(10 * 60);
 // this should be a fraction of the MAX_UNSUB_TIME
-const RECEIVERS_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const RECEIVERS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 pub async fn process_sub_channel(
     subs: SubsManager,
@@ -279,7 +279,7 @@ pub enum MatcherUpsertError {
     #[error("could not expand sql statement")]
     CouldNotExpand,
     #[error(transparent)]
-    NormalizeStatement(#[from] NormalizeStatementError),
+    NormalizeStatement(#[from] Box<NormalizeStatementError>),
     #[error(transparent)]
     Matcher(#[from] MatcherError),
     #[error("a `from` query param was supplied, but no existing subscription found")]
@@ -458,8 +458,7 @@ pub async fn catch_up_sub(
 
     let mut last_change_id = {
         let res = match params.from {
-            Some(from) => catch_up_sub_from(&matcher, from, &evt_tx).await,
-            None => {
+            Some(ChangeId(0)) | None => {
                 if params.skip_rows {
                     let conn = match matcher.pool().get().await {
                         Ok(conn) => conn,
@@ -475,6 +474,7 @@ pub async fn catch_up_sub(
                     catch_up_sub_anew(&matcher, &evt_tx).await
                 }
             }
+            Some(from) => catch_up_sub_from(&matcher, from, &evt_tx).await,
         };
 
         match res {
@@ -884,7 +884,7 @@ mod tests {
     use corro_types::actor::ActorId;
     use corro_types::api::NotifyEvent;
     use corro_types::api::{ColumnName, TableName};
-    use corro_types::base::{CrsqlDbVersion, CrsqlSeq, Version};
+    use corro_types::base::{dbsr, CrsqlDbVersion, CrsqlSeq};
     use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
     use corro_types::change::Change;
     use corro_types::pubsub::pack_columns;
@@ -896,7 +896,6 @@ mod tests {
     use http_body::Body;
     use serde::de::DeserializeOwned;
     use spawn::wait_for_all_pending_handles;
-    use std::ops::RangeInclusive;
     use std::time::Instant;
     use tokio::time::timeout;
     use tokio_util::codec::{Decoder, LinesCodec};
@@ -1355,8 +1354,87 @@ mod tests {
             )
         );
 
-        // skip rows!
+        // change id 0 should start subs afresh
+        let mut res = api_v1_subs(
+            Extension(agent.clone()),
+            Extension(bcast_cache.clone()),
+            Extension(tripwire.clone()),
+            axum::extract::Query(SubParams {
+                from: Some(0.into()),
+                ..Default::default()
+            }),
+            axum::Json(Statement::Simple("select * from tests".into())),
+        )
+        .await
+        .into_response();
 
+        if !res.status().is_success() {
+            let b = res.body_mut().data().await.unwrap().unwrap();
+            println!("body: {}", String::from_utf8_lossy(&b));
+        }
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut rows_zero = RowsIter {
+            body: res.into_body(),
+            codec: LinesCodec::new(),
+            buf: BytesMut::new(),
+            done: false,
+        };
+
+        assert_eq!(
+            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Columns(vec!["id".into(), "text".into()])
+        );
+
+        assert_eq!(
+            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
+        );
+
+        assert_eq!(
+            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Row(
+                RowId(2),
+                vec!["service-id-2".into(), "service-name-2".into()]
+            )
+        );
+
+        assert_eq!(
+            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Row(
+                RowId(3),
+                vec!["service-id-3".into(), "service-name-3".into()],
+            )
+        );
+
+        assert_eq!(
+            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Row(
+                RowId(4),
+                vec!["service-id-4".into(), "service-name-4".into()]
+            )
+        );
+
+        assert_eq!(
+            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Row(
+                RowId(5),
+                vec!["service-id-5".into(), "service-name-5".into()]
+            )
+        );
+
+        assert_eq!(
+            rows_zero
+                .recv::<QueryEvent>()
+                .await
+                .unwrap()
+                .unwrap()
+                .meta(),
+            QueryEventMeta::EndOfQuery(Some(ChangeId(3)))
+        );
+
+        // skip rows!
         let mut res = api_v1_subs(
             Extension(agent.clone()),
             Extension(bcast_cache.clone()),
@@ -1503,9 +1581,9 @@ mod tests {
         let changes = ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: Version(1),
+                version: CrsqlDbVersion(1),
                 changes: vec![change1, change2],
-                seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(1)),
+                seqs: dbsr!(0, 1),
                 last_seq: CrsqlSeq(1),
                 ts: Default::default(),
             },
@@ -1591,7 +1669,7 @@ mod tests {
             cid: ColumnName("col1".into()),
             val: "two".into(),
             col_version: 1,
-            db_version: CrsqlDbVersion(1),
+            db_version: CrsqlDbVersion(2),
             seq: CrsqlSeq(0),
             site_id: actor_id.to_bytes(),
             cl: 1,
@@ -1600,9 +1678,9 @@ mod tests {
         let changes = ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: Version(2),
+                version: CrsqlDbVersion(2),
                 changes: vec![change3],
-                seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(0)),
+                seqs: dbsr!(0, 0),
                 last_seq: CrsqlSeq(1),
                 ts: Default::default(),
             },
@@ -1620,7 +1698,7 @@ mod tests {
         {
             let conn = ta1.agent.pool().read().await?;
             let end = conn.query_row(
-                "SELECT end_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
+                "SELECT end_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND db_version = ?",
                 (actor_id, 2),
                 |row| row.get::<_, CrsqlSeq>(0),
             )?;
@@ -1633,7 +1711,7 @@ mod tests {
             cid: ColumnName("col2".into()),
             val: "two line".into(),
             col_version: 1,
-            db_version: CrsqlDbVersion(1),
+            db_version: CrsqlDbVersion(2),
             seq: CrsqlSeq(1),
             site_id: actor_id.to_bytes(),
             cl: 1,
@@ -1642,9 +1720,9 @@ mod tests {
         let changes = ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: Version(2),
+                version: CrsqlDbVersion(2),
                 changes: vec![change4],
-                seqs: RangeInclusive::new(CrsqlSeq(1), CrsqlSeq(1)),
+                seqs: dbsr!(1, 1),
                 last_seq: CrsqlSeq(1),
                 ts: Default::default(),
             },
@@ -1678,6 +1756,7 @@ mod tests {
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
+        ta1.agent.subs_manager().drop_handles().await;
         wait_for_all_pending_handles().await;
 
         Ok(())
