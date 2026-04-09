@@ -16,6 +16,7 @@ use crate::{
         SyncClientError, ANNOUNCE_INTERVAL,
     },
     api::peer::parallel_sync,
+    broadcast::PlumtreeInput,
     transport::{Transport, TransportExt},
 };
 use antithesis_sdk::assert_sometimes;
@@ -25,7 +26,7 @@ use corro_types::{
     agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
     broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
-    channel::CorroReceiver,
+    channel::{CorroReceiver, CorroSender},
     members::MemberAddedResult,
     sync::generate_sync,
 };
@@ -55,6 +56,7 @@ pub fn spawn_gossipserver_handler(
     bookie: &Bookie,
     tripwire: &Tripwire,
     gossip_server_endpoint: quinn::Endpoint,
+    tx_plumtree: CorroSender<PlumtreeInput>,
 ) {
     spawn_counted({
         let agent = agent.clone();
@@ -73,7 +75,13 @@ pub fn spawn_gossipserver_handler(
                 };
 
                 // Spawn incoming connection handlers
-                spawn_incoming_connection_handlers(&agent, &bookie, &tripwire, connecting);
+                spawn_incoming_connection_handlers(
+                    &agent,
+                    &bookie,
+                    &tripwire,
+                    connecting,
+                    tx_plumtree.clone(),
+                );
             }
 
             // graceful shutdown
@@ -95,6 +103,7 @@ pub fn spawn_incoming_connection_handlers(
     bookie: &Bookie,
     tripwire: &Tripwire,
     connecting: quinn::Connecting,
+    tx_plumtree: CorroSender<PlumtreeInput>,
 ) {
     let agent = agent.clone();
     let bookie = bookie.clone();
@@ -123,6 +132,7 @@ pub fn spawn_incoming_connection_handlers(
             &conn,
             agent.cluster_id(),
             agent.tx_changes().clone(),
+            tx_plumtree,
         );
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
@@ -279,6 +289,7 @@ pub async fn handle_gossip_to_send(
 pub async fn handle_notifications(
     agent: Agent,
     mut notification_rx: CorroReceiver<OwnedNotification<Actor>>,
+    tx_plumtree: CorroSender<PlumtreeInput>,
 ) {
     while let Some(notification) = notification_rx.recv().await {
         trace!("handle notification");
@@ -301,6 +312,11 @@ pub async fn handle_notifications(
                             {
                                 error!("could not send new foca cluster size: {e}");
                             }
+                        }
+
+                        if let Err(e) = tx_plumtree.send(PlumtreeInput::MemberUp(actor.id())).await
+                        {
+                            error!("could not forward MemberUp to plumtree: {e}");
                         }
                     }
                     MemberAddedResult::Updated => {
@@ -340,6 +356,13 @@ pub async fn handle_notifications(
                         if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await {
                             error!("could not send new foca cluster size: {e}");
                         }
+                    }
+
+                    if let Err(e) = tx_plumtree
+                        .send(PlumtreeInput::MemberDown(actor.id()))
+                        .await
+                    {
+                        error!("could not forward MemberDown to plumtree: {e}");
                     }
                 }
                 counter!("corro.swim.notification", "type" => "memberdown").increment(1);

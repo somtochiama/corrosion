@@ -29,6 +29,7 @@ use crate::{
             update::SharedUpdateBroadcastCache,
         },
     },
+    broadcast::PlumtreeInput,
     transport::Transport,
 };
 use corro_types::{
@@ -38,7 +39,7 @@ use corro_types::{
     },
     base::{CrsqlDbVersion, CrsqlDbVersionRange},
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
-    channel::{bounded, CorroReceiver},
+    channel::{bounded, CorroReceiver, CorroSender},
     config::Config,
     members::Members,
     pubsub::{Matcher, SubsManager},
@@ -58,6 +59,8 @@ pub struct AgentOptions {
     pub rx_clear_buf: CorroReceiver<(ActorId, CrsqlDbVersionRange)>,
     pub rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
     pub rx_foca: CorroReceiver<FocaInput>,
+    pub tx_plumtree: CorroSender<PlumtreeInput>,
+    pub rx_plumtree: CorroReceiver<PlumtreeInput>,
     pub rtt_rx: TokioReceiver<(SocketAddr, Duration)>,
     pub subs_manager: SubsManager,
     pub subs_bcast_cache: SharedMatcherBroadcastCache,
@@ -160,6 +163,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let (tx_bcast, rx_bcast) = bounded(conf.perf.bcast_channel_len, "bcast");
     let (tx_changes, rx_changes) = bounded(conf.perf.changes_channel_len, "changes");
     let (tx_foca, rx_foca) = bounded(conf.perf.foca_channel_len, "foca");
+    let (tx_plumtree, rx_plumtree) = bounded(512, "plumtree");
 
     let lock_registry = LockRegistry::default();
 
@@ -250,6 +254,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         rx_clear_buf,
         rx_changes,
         rx_foca,
+        tx_plumtree,
+        rx_plumtree,
         rtt_rx,
         subs_manager: subs_manager.clone(),
         subs_bcast_cache,
