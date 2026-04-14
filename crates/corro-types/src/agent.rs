@@ -44,7 +44,7 @@ use tripwire::Tripwire;
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
-    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
+    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, PlumtreeInput, Timestamp},
     channel::{bounded, CorroSender},
     config::Config,
     pubsub::SubsManager,
@@ -78,6 +78,7 @@ pub struct AgentConfig {
     pub tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
     pub tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
     pub tx_foca: CorroSender<FocaInput>,
+    pub tx_plumtree: CorroSender<PlumtreeInput>,
 
     pub write_sema: Arc<Semaphore>,
 
@@ -106,6 +107,7 @@ pub struct AgentInner {
     tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
     tx_foca: CorroSender<FocaInput>,
+    tx_plumtree: CorroSender<PlumtreeInput>,
     write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
     cluster_id: ArcSwap<ClusterId>,
@@ -136,6 +138,7 @@ impl Agent {
             tx_clear_buf: config.tx_clear_buf,
             tx_changes: config.tx_changes,
             tx_foca: config.tx_foca,
+            tx_plumtree: config.tx_plumtree,
             write_sema: config.write_sema,
             schema: config.schema,
             cluster_id: ArcSwap::from_pointee(config.cluster_id),
@@ -199,6 +202,10 @@ impl Agent {
 
     pub fn tx_foca(&self) -> &CorroSender<FocaInput> {
         &self.0.tx_foca
+    }
+
+    pub fn tx_plumtree(&self) -> &CorroSender<PlumtreeInput> {
+        &self.0.tx_plumtree
     }
 
     pub fn write_sema(&self) -> &Arc<Semaphore> {

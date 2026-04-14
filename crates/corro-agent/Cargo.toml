@@ -29,7 +29,7 @@ itertools = { workspace = true }
 metrics = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
-plum-foca = { path = "../../plum-foca" }
+plum-foca = { path = "../../plum-foca", features = ["tracing"] }
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
 quinn-plaintext = { workspace = true }

@@ -115,6 +115,19 @@ pub enum AuthzV1 {
     Token(String),
 }
 
+#[derive(Debug)]
+pub enum PlumtreeInput {
+    /// A wire message received from a remote peer (deserialized from uni-stream).
+    Wire(PlumTreeMsg),
+    /// Foca membership: a new peer appeared.
+    MemberUp(ActorId),
+    /// Foca membership: a peer left.
+    MemberDown(ActorId),
+    /// Application wants to originate a new broadcast.
+    Broadcast(BroadcastV1),
+}
+
+
 #[derive(Clone, Debug, Readable, Writable)]
 pub enum BroadcastV1 {
     Change(ChangeV1),

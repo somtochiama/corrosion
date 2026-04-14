@@ -1,6 +1,6 @@
 use corro_types::{
     actor::ClusterId,
-    broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1},
+    broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1, PlumtreeInput},
     channel::CorroSender,
 };
 use metrics::counter;
@@ -10,7 +10,6 @@ use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, trace};
 use tripwire::Tripwire;
 
-use crate::broadcast::PlumtreeInput;
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.

@@ -1,6 +1,9 @@
 //! Start the root agent tasks
 
-use std::time::Instant;
+use std::{
+    sync::{atomic::AtomicU64, Arc},
+    time::Instant,
+};
 
 use crate::api::public::execute_schema;
 use crate::{
@@ -57,7 +60,6 @@ async fn run(
         rx_clear_buf,
         rx_changes,
         rx_foca,
-        tx_plumtree,
         rx_plumtree,
         subs_manager,
         subs_bcast_cache,
@@ -136,8 +138,7 @@ async fn run(
     ));
     tokio::spawn(handlers::handle_notifications(
         agent.clone(),
-        notifications_rx,
-        tx_plumtree.clone(),
+        notifications_rx    
     ));
 
     spawn_handle_db_maintenance(&agent);
@@ -244,6 +245,12 @@ async fn run(
             rx_plumtree,
             agent.tx_changes().clone(),
             tripwire.clone(),
+            Arc::new((
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            )),
         )
         .inspect(|_| info!("plumtree loop is done")),
     );
@@ -255,7 +262,6 @@ async fn run(
         &bookie,
         &tripwire,
         gossip_server_endpoint,
-        tx_plumtree.clone(),
     );
 
     let changes_handle = spawn_counted(
