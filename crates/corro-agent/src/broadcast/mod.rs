@@ -45,6 +45,8 @@ use corro_types::{
 
 use crate::{agent::util::log_at_pow_10, transport::Transport};
 
+pub mod plumtree;
+
 #[derive(Clone)]
 struct TimerSpawner {
     send: mpsc::UnboundedSender<(Duration, Timer<Actor>)>,
@@ -1249,7 +1251,7 @@ mod tests {
             let conn = conn.await.unwrap();
 
             let (tx_changes, mut rx_changes) = bounded(100, "changes");
-            spawn_unipayload_handler(&tripwire, &conn, ta1.agent.cluster_id(), tx_changes);
+            spawn_unipayload_handler(&tripwire, &conn, ta1.agent.cluster_id(), tx_changes, None);
 
             // we should receive five items starting from the biggest version
             for i in (0..5).rev() {

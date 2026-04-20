@@ -10,7 +10,7 @@ use crate::{
         reaper::spawn_reaper,
         setup, util, AgentOptions,
     },
-    broadcast::runtime_loop,
+    broadcast::{plumtree, runtime_loop},
     transport::Transport,
 };
 
@@ -54,6 +54,7 @@ async fn run(
         api_listeners,
         mut tripwire,
         rx_bcast,
+        rx_plumtree,
         rx_apply,
         rx_clear_buf,
         rx_changes,
@@ -106,7 +107,35 @@ async fn run(
     handlers::spawn_swim_announcer(&agent, gossip_addr, tripwire.clone());
 
     // Load existing cluster members into the SWIM runtime
+    // Clone before consuming so we can seed the plumtree engine below.
+    let member_states_for_plumtree = member_states.clone();
     util::initialise_foca(&agent, member_states).await;
+
+    //// Launch the plumtree epidemic-broadcast engine.
+    // The channel was created in setup() and tx is stored on the Agent so
+    // that broadcast_changes() and connection handlers can send events.
+    plumtree::launch(
+        rx_plumtree,
+        agent.tx_plumtree().clone(),
+        agent.actor_id(),
+        agent.cluster_id(),
+        transport.clone(),
+        agent.tx_changes().clone(),
+        tripwire.clone(),
+    );
+
+    // Seed the engine with members that are already known to be alive so we
+    // don't miss anyone who joined before this node started.
+    for (addr, member) in member_states_for_plumtree {
+        if matches!(member.state(), foca::State::Alive) {
+            let _ = agent
+                .tx_plumtree()
+                .try_send(corro_types::broadcast::PlumtreeInput::PeerUp {
+                    peer: member.id().id(),
+                    addr,
+                });
+        }
+    }
 
     // Load schema from paths
     let stmts = corro_utils::read_files_from_paths(&agent.config().db.schema_paths).await?;

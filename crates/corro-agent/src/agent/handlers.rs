@@ -24,7 +24,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, PlumtreeInput},
     channel::CorroReceiver,
     members::MemberAddedResult,
     sqlite::log_slow_inflight_queries,
@@ -133,11 +133,26 @@ pub fn spawn_incoming_connection_handlers(
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
+
+        // Resolve the peer's ActorId from its address so the plumtree engine
+        // knows which peer sent each message (for PRUNE/GRAFT decisions).
+        // The lookup may fail if SWIM hasn't yet processed the MemberUp for
+        // this peer; in that case we fall back to bypassing the plumtree engine
+        // (changes still land via tx_changes, they just won't be tree-routed).
+        let plumtree_arg = agent
+            .members()
+            .read()
+            .by_addr
+            .get(&remote_addr)
+            .copied()
+            .map(|from| (from, agent.tx_plumtree().clone()));
+
         uni::spawn_unipayload_handler(
             &tripwire,
             &conn,
             agent.cluster_id(),
             agent.tx_changes().clone(),
+            plumtree_arg,
         );
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
@@ -337,6 +352,13 @@ pub async fn handle_notifications(
                 let member_added_res = agent.members().write().add_member(&actor);
                 info!("Member Up {actor:?} (result: {member_added_res:?})");
 
+                // Notify the plumtree engine so it can add this peer to its
+                // eager set and store the address for outbound sends.
+                let _ = agent.tx_plumtree().try_send(PlumtreeInput::PeerUp {
+                    peer: actor.id(),
+                    addr: actor.addr(),
+                });
+
                 match member_added_res {
                     MemberAddedResult::NewMember | MemberAddedResult::Removed => {
                         if matches!(member_added_res, MemberAddedResult::Removed) {
@@ -388,6 +410,11 @@ pub async fn handle_notifications(
                 counter!("corro.swim.notification", "type" => "memberup").increment(1);
             }
             OwnedNotification::MemberDown(actor) => {
+                // Notify the plumtree engine to remove the peer from all sets.
+                let _ = agent
+                    .tx_plumtree()
+                    .try_send(PlumtreeInput::PeerDown(actor.id()));
+
                 let removed = { agent.members().write().remove_member(&actor) };
                 info!("Member Down {actor:?} (removed: {removed})");
                 if removed {

@@ -1,6 +1,6 @@
 use std::{
-    cmp, collections::HashMap, fmt, io, num::NonZeroU32, num::ParseIntError, ops::Deref,
-    time::Duration,
+    cmp, collections::HashMap, fmt, io, net::SocketAddr, num::NonZeroU32, num::ParseIntError,
+    ops::Deref, time::Duration,
 };
 
 use antithesis_sdk::assert_sometimes;
@@ -89,9 +89,26 @@ pub enum AuthzV1 {
     Token(String),
 }
 
+/// Stable identity for a broadcast message, used by the plumtree protocol
+/// for dedup, IHAVE announcements, and GRAFT requests.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Readable, Writable)]
+pub struct MessageId {
+    pub actor_id: ActorId,
+    pub version: CrsqlDbVersion,
+}
+
 #[derive(Clone, Debug, Readable, Writable)]
 pub enum BroadcastV1 {
     Change(ChangeV1),
+    /// Lazy push: "I have message `mid`, do you need it?"
+    /// `round` is the hop count since origination, used to pick the
+    /// closest candidate when issuing a GRAFT.
+    Ihave { mid: MessageId, round: u32 },
+    /// "Please send me message `mid` eagerly (I missed it)."
+    /// Receiver should also move sender into its eager peer set.
+    Graft { mid: MessageId },
+    /// "Stop sending me full payloads; switch to lazy IHAVE for future messages."
+    Prune,
 }
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
@@ -114,6 +131,24 @@ pub enum ChangeSource {
 pub struct ChangeV1 {
     pub actor_id: ActorId,
     pub changeset: Changeset,
+}
+
+impl ChangeV1 {
+    /// Stable identifier for this change, used by the plumtree broadcast
+    /// protocol to deduplicate and announce messages.  Returns `None` for
+    /// `EmptySet` changesets, which carry version ranges rather than a
+    /// single version and are forwarded without tree logic.
+    pub fn message_id(&self) -> Option<MessageId> {
+        match &self.changeset {
+            Changeset::Full { version, .. } | Changeset::FullV2 { version, .. } => {
+                Some(MessageId { actor_id: self.actor_id, version: *version })
+            }
+            Changeset::Empty { versions, .. } => {
+                Some(MessageId { actor_id: self.actor_id, version: versions.start() })
+            }
+            Changeset::EmptySet { .. } => None,
+        }
+    }
 }
 
 impl Deref for ChangeV1 {
@@ -588,6 +623,30 @@ pub enum BroadcastInput {
     AddBroadcast(BroadcastV1),
 }
 
+/// Events fed into the plumtree broadcast engine.
+///
+/// Lives here (rather than in corro-agent) so that `broadcast_changes` and
+/// `Agent::tx_plumtree` can reference it without a circular dependency.
+#[derive(Debug)]
+pub enum PlumtreeInput {
+    /// Decoded message received from a remote peer.
+    Incoming { from: ActorId, msg: BroadcastV1 },
+    /// A local database commit — this node is the originator.
+    Originate(ChangeV1),
+    /// FOCA notified us that a peer is reachable.
+    /// Carries the SocketAddr so the engine can resolve addresses
+    /// without holding the Members lock.
+    PeerUp { peer: ActorId, addr: SocketAddr },
+    /// FOCA notified us that a peer is no longer reachable.
+    PeerDown(ActorId),
+    /// Internal: GRAFT timer expired for this message.
+    #[doc(hidden)]
+    GraftTimeout(MessageId),
+    /// Internal: transport send to this peer failed.
+    #[doc(hidden)]
+    SendFailed { to: ActorId, mid: MessageId },
+}
+
 pub struct DispatchRuntime<T> {
     pub to_send: CorroSender<(T, Bytes)>,
     pub to_schedule: CorroSender<(Duration, Timer<T>)>,
@@ -703,19 +762,17 @@ pub async fn broadcast_changes(
                     match_changes(agent.subs_manager(), &changeset, db_version);
                     match_changes(agent.updates_manager(), &changeset, db_version);
 
-                    let tx_bcast = agent.tx_bcast().clone();
+                    let tx_plumtree = agent.tx_plumtree().clone();
                     assert_sometimes!(true, "Corrosion broadcasts changes");
                     tokio::spawn(async move {
-                        if let Err(e) = tx_bcast
-                            .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
-                                ChangeV1 {
-                                    actor_id,
-                                    changeset,
-                                },
-                            )))
+                        if let Err(e) = tx_plumtree
+                            .send(PlumtreeInput::Originate(ChangeV1 {
+                                actor_id,
+                                changeset,
+                            }))
                             .await
                         {
-                            error!("could not send change message for broadcast: {e}");
+                            error!("could not send change to plumtree engine: {e}");
                         }
                     });
                 }

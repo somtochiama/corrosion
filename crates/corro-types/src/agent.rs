@@ -33,7 +33,7 @@ use tripwire::Tripwire;
 use crate::{
     actor::{Actor, ActorId, ClusterId, MemberId},
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
-    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
+    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, PlumtreeInput, Timestamp},
     channel::{bounded, CorroSender},
     config::Config,
     metrics_tracker::MetricsTracker,
@@ -67,6 +67,7 @@ pub struct AgentConfig {
     pub bookie: Bookie,
 
     pub tx_bcast: CorroSender<BroadcastInput>,
+    pub tx_plumtree: CorroSender<PlumtreeInput>,
     pub tx_apply: CorroSender<(ActorId, CrsqlDbVersion)>,
     pub tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
     pub tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
@@ -99,6 +100,7 @@ pub struct AgentInner {
     booked: Booked,
     bookie: Bookie,
     tx_bcast: CorroSender<BroadcastInput>,
+    tx_plumtree: CorroSender<PlumtreeInput>,
     tx_apply: CorroSender<(ActorId, CrsqlDbVersion)>,
     tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
@@ -131,6 +133,7 @@ impl Agent {
             booked: config.booked,
             bookie: config.bookie,
             tx_bcast: config.tx_bcast,
+            tx_plumtree: config.tx_plumtree,
             tx_apply: config.tx_apply,
             tx_clear_buf: config.tx_clear_buf,
             tx_changes: config.tx_changes,
@@ -187,6 +190,10 @@ impl Agent {
 
     pub fn tx_bcast(&self) -> &CorroSender<BroadcastInput> {
         &self.0.tx_bcast
+    }
+
+    pub fn tx_plumtree(&self) -> &CorroSender<PlumtreeInput> {
+        &self.0.tx_plumtree
     }
 
     pub fn tx_apply(&self) -> &CorroSender<(ActorId, CrsqlDbVersion)> {

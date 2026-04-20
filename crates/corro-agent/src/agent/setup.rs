@@ -32,7 +32,7 @@ use corro_types::{
     actor::ActorId,
     agent::{migrate, Agent, AgentConfig, BookedVersions, Bookie, SplitPool},
     base::{CrsqlDbVersion, CrsqlDbVersionRange},
-    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
+    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, PlumtreeInput},
     channel::{bounded, CorroReceiver},
     config::Config,
     members::Members,
@@ -49,6 +49,7 @@ pub struct AgentOptions {
     pub transport: Transport,
     pub api_listeners: Vec<TcpListener>,
     pub rx_bcast: CorroReceiver<BroadcastInput>,
+    pub rx_plumtree: CorroReceiver<PlumtreeInput>,
     pub rx_apply: CorroReceiver<(ActorId, CrsqlDbVersion)>,
     pub rx_clear_buf: CorroReceiver<(ActorId, CrsqlDbVersionRange)>,
     pub rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
@@ -153,6 +154,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let api_addr = api_listeners.first().unwrap().local_addr()?;
 
     let (tx_bcast, rx_bcast) = bounded(conf.perf.bcast_channel_len, "bcast");
+    let (tx_plumtree, rx_plumtree) = bounded(conf.perf.bcast_channel_len, "plumtree");
     let (tx_changes, rx_changes) = bounded(conf.perf.changes_channel_len, "changes");
     let (tx_foca, rx_foca) = bounded(conf.perf.foca_channel_len, "foca");
 
@@ -174,6 +176,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         transport: transport.clone(),
         api_listeners,
         rx_bcast,
+        rx_plumtree,
         rx_apply,
         rx_clear_buf,
         rx_changes,
@@ -197,6 +200,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         booked,
         bookie,
         tx_bcast,
+        tx_plumtree,
         tx_apply,
         tx_clear_buf,
         tx_changes,
