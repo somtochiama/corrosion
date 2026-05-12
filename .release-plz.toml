@@ -1,0 +1,7 @@
+[workspace]
+release = false
+
+[[package]]
+name = "sqlite-pool"
+release = true
+git_release_enable = false
