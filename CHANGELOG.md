@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.0.0
+## v1.0.1
 
 v1.0.0 is packed with a lot of new features and bug fixes. Some high-level details include:
 
