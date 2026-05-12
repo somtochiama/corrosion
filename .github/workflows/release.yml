@@ -13,8 +13,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish-crates:
-    release-plz-release:
+  release-plz-release:
     name: Release-plz release
     runs-on: ubuntu-latest
     if: ${{ github.repository_owner == 'somtochi' }}
